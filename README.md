@@ -292,10 +292,41 @@ POST /api/open-dir                  → 资源管理器打开插件目录
 
 ## 7.6 子代理轨迹面板（`dual-model` v0.8.0）
 
-主从协作的实际执行发生在子代理里，而**官方 UI 看不到子代理内部**：它只渲染一个折叠的 `Agent` 卡片。
+主从协作的实际执行发生在子代理里，而**普通 `Agent` 调用在官方 UI 里看不到过程**：只渲染一个折叠卡片。
 点右下角浮标上方的「子代理轨迹」，能看到每个子代理的思考、工具调用和返回结果。
 
-### 为什么必须读文件（而不是订阅事件）
+### 前提：委派时必须带 `name`
+
+官方对 `Agent` 工具做了两条分支，**只差一个 `name` 参数**：
+
+| 调用形态 | 官方行为 | 界面上能看到 |
+|---|---|---|
+| `Agent({ description, prompt })` | 普通子代理 | 一个折叠卡片，看不到过程 |
+| `Agent({ name, description, prompt })` | **团队成员**（`team-member-spawned`） | **自带流式预览框**，实时显示思考与工具调用 |
+
+带 `name` 时官方会自动建团队（`~/.workbuddy/teams/_auto_<会话ID>/`），
+CLI 提示原话：*"Named Agent() auto-creates a team if none exists — do not call TeamCreate first."*
+所以**不需要**先 `TeamCreate`，也不用 `run_in_background`。
+
+界面上的 DOM 特征（可用来验证是否生效）：
+
+```
+.conversation-team-collaboration              ← 那个「N 位团队成员」面板
+.conversation-team-collaboration--streaming   ← 流式中
+.conversation-team-collaboration__member      ← 每个成员一行
+.conversation-team-collaboration__status--completed
+```
+
+`dual-model` 的 hook 做了两层保证：
+
+1. `UserPromptSubmit` 注入规则，要求主模型每次委派都带 `name`（用职责英文名）；
+2. `PreToolUse(Agent)` 兜底——**主模型漏了 name 就自动补一个**（从 description 抽英文词，
+   抽不到就用 `subagent_type`），保证预览框必然出现。
+
+关键是：**两种调用都会把轨迹写进同一个 `subagents/agent-*.jsonl`**，
+所以官方预览框和我们自己的轨迹面板可以并存，互不冲突。
+
+### 为什么轨迹面板必须读文件（而不是订阅事件）
 
 先试过事件流，走不通，实测数据：
 
