@@ -1,10 +1,14 @@
 {
   "id": "dual-model",
   "name": "双模型协同",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "managed": true,
-  "description": "主模型决策 + 工作模型执行：hook 在每次子代理调用时强制指定模型，对话途中改完即生效",
+  "description": "主模型决策 + 工作模型执行，并展示子代理的思考与工具调用轨迹",
   "renderer": "renderer.js",
+  "rendererIncludes": ["subagent-panel.js"],
+  "backend": {
+    "entry": "backend.cjs"
+  },
   "contributes": {
     "panel": {
       "position": "bottom-right"

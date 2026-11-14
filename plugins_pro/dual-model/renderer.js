@@ -84,8 +84,27 @@ function findFns(root, name, depth) {
     return out;
 }
 
+/**
+ * 取当前会话 ID。
+ *
+ * 不能用「最近写入的会话目录」猜 —— 同时开两个会话时，另一个在跑的那个才是最新写的，
+ * 会把面板指到错误的会话上。
+ *
+ * 可靠来源是主对话区的 [data-root-id]：官方 DocumentRenderer 用它标记当前渲染的文档根，
+ * 值就是会话 ID，全局唯一，切换会话时随 DOM 一起变。
+ * 注意别用侧边栏的 [data-conversation-id] —— 那是列表里每一项都有的，拿到的可能是任意一个。
+ */
 function currentSessionId() {
     try {
+        var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        // 主对话区的文档根。限定在 message-list 视口内，避免拿到别的面板
+        var roots = document.querySelectorAll('.cr-message-list-viewport [data-root-id]');
+        if (!roots.length) roots = document.querySelectorAll('[data-root-id]');
+        for (var i = 0; i < roots.length; i++) {
+            var v = roots[i].getAttribute('data-root-id');
+            if (v && UUID.test(v)) return v;
+        }
+        // 兜底：老版本可能没有 data-root-id
         var d = window.workbuddyDesktop;
         var direct = d && (d.currentSessionId || d.sessionId);
         if (typeof direct === 'string' && direct) return direct;
@@ -1377,11 +1396,52 @@ function activate(ctx) {
         openPanel();
     }
 
+    /* ---------- 子代理轨迹面板 ---------- */
+
+    var subagentPanel = null;
+    var trailBtn = null;
+
+    function ensureSubagentPanel() {
+        if (subagentPanel) return subagentPanel;
+        if (!window.__duoSubagent || typeof window.__duoSubagent.create !== 'function') {
+            ctx.log('子代理面板模块未加载（检查 rendererIncludes）');
+            return null;
+        }
+        // 页面里拿不到 cwd，后端会按 sessionId 全盘搜索，这里传空
+        subagentPanel = window.__duoSubagent.create(ctx, currentSessionId, function () { return ''; });
+        return subagentPanel;
+    }
+
+    /** 徽标旁的「轨迹」按钮：只做开关，不抢徽标本身的设置入口 */
+    function mountTrailButton() {
+        if (trailBtn && trailBtn.isConnected) return;
+        trailBtn = document.createElement('div');
+        trailBtn.setAttribute('data-wbpro-trail', PLUGIN_ID);
+        trailBtn.style.cssText = [
+            'position:fixed', 'right:18px', 'bottom:112px', 'z-index:2147482990',
+            'padding:4px 9px', 'border-radius:999px', 'cursor:pointer',
+            'font:11px/1.4 system-ui,-apple-system,sans-serif',
+            'background:rgba(28,28,32,.86)', 'color:#c9c4f7',
+            'border:1px solid rgba(127,119,221,.45)',
+            'backdrop-filter:blur(6px)', 'user-select:none',
+        ].join(';');
+        trailBtn.textContent = '子代理轨迹';
+        trailBtn.title = '查看子代理的思考与工具调用';
+        trailBtn.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var p = ensureSubagentPanel();
+            if (p) p.toggle();
+        });
+        document.body.appendChild(trailBtn);
+    }
+
     /* ---------- 启动 ---------- */
 
     try {
         detect();
         mountBadge();
+        mountTrailButton();
         loadConfig();
         subscribeEvents();
         subscribeConfigChange();
@@ -1394,6 +1454,7 @@ function activate(ctx) {
 
     var keeper = setInterval(function () {
         if (badge && !badge.isConnected && document.body) document.body.appendChild(badge);
+        if (trailBtn && !trailBtn.isConnected && document.body) document.body.appendChild(trailBtn);
     }, 3000);
     ctx.onCleanup(function () { clearInterval(keeper); });
 
@@ -1418,6 +1479,12 @@ function activate(ctx) {
         panelRef = null;
         badge && badge.remove();
         badge = null;
+        trailBtn && trailBtn.remove();
+        trailBtn = null;
+        if (subagentPanel) {
+            try { subagentPanel.destroy(); } catch (e) { /* ignore */ }
+            subagentPanel = null;
+        }
     });
 
     ctx.log('双模型协同已加载', JSON.stringify(probe));

@@ -128,11 +128,24 @@ wbpro/
 |---|---|---|
 | `id` | ✅ | 唯一标识，建议小写中划线 |
 | `renderer` | 可选 | UI 入口；缺省时自动找 `renderer.js` |
+| `rendererIncludes` | 可选 | 额外要内联的文件数组，按顺序拼在入口之前（见下） |
 | `backend.entry` | 可选 | 后端入口；缺省时自动探测 `backend.cjs` / `backend.mjs` / `backend.js` |
 | `enabled` | 可选 | 设为 `false` 可临时停用 |
 | `contributes.panel.position` | 可选 | `top-right` / `top-left` / `bottom-right` / `bottom-left` |
 
 `renderer.js` 约定：定义 `activate(ctx)`，返回值作为卸载函数。
+
+**多文件插件**：bundle 是把整个 renderer 当函数体注入的，插件里没有 `require` / `module`，
+所以拆文件不能靠模块系统。用 `rendererIncludes` 声明额外文件，读取阶段会按顺序拼到入口之前：
+
+```json
+{
+  "renderer": "renderer.js",
+  "rendererIncludes": ["subagent-panel.js"]
+}
+```
+
+被包含的文件可以直接写 `window.xxx = {...}` 暴露给入口用（`dual-model` 就是这么拆出子代理面板的）。
 
 ```js
 function activate(ctx) {
@@ -276,6 +289,107 @@ POST /api/open-dir                  → 资源管理器打开插件目录
 > 需要重启一次应用把 env 清掉，之后才能享受"改完即生效"。
 
 想换回普通档位：下拉里点任意真实模型即可退出协作（会把标签交还给 React，不会卡在「主从模型」）。
+
+## 7.6 子代理轨迹面板（`dual-model` v0.8.0）
+
+主从协作的实际执行发生在子代理里，而**官方 UI 看不到子代理内部**：它只渲染一个折叠的 `Agent` 卡片。
+点右下角浮标上方的「子代理轨迹」，能看到每个子代理的思考、工具调用和返回结果。
+
+### 为什么必须读文件（而不是订阅事件）
+
+先试过事件流，走不通，实测数据：
+
+| 通道 | 结果 |
+|---|---|
+| `session:event` | **0 条**（wbpro 早期订阅的就是这条，一直没数据） |
+| `wb:event` | 有流量，但 `childAgentEvent` 只带生命周期 |
+
+`childAgentEvent` 的真实载荷：
+
+```json
+{ "event": "listChanged",
+  "snapshot": { "kind": "subagent", "projectionId": "subagent:call_xxx",
+                "requests": [], "requestsIncluded": false, "state": "running" } }
+```
+
+`requestsIncluded: false` 是明确的信号：官方**故意**不在事件里带内容。渲染层要另调
+`childAgentRequests(conversationId, projectionId, page)` 去拉，但那个方法挂在按会话实例创建的桥接对象上，
+插件拿不到。`__wbInvoke('childAgentRequests')` 直接返回 `No handler`。
+
+**但数据一直都在**，CLI 会把子代理的完整轨迹独立落盘：
+
+```
+~/.workbuddy/projects/<编码cwd>/<会话ID>/subagents/agent-<uuid>.jsonl
+```
+
+一个真实文件的类型分布（183 行）：`reasoning` 35、`function_call` 67、`function_call_result` 66、`message` 15。
+每条都带 `providerData.isSubAgent: true`、`agent` 名、`model`、`stepSeq`。
+
+### 实现
+
+```
+dual-model/
+├─ backend.cjs          读 jsonl，提供 /api/subagents 与 /api/subagent
+├─ subagent-panel.js    面板 UI（通过 rendererIncludes 内联）
+└─ renderer.js          加一个「子代理轨迹」按钮，挂面板
+```
+
+后端做三件事：
+
+1. **定位会话**。见下方「会话定位」。
+2. **解析 jsonl**。文件可能正在被写入，最后一行常是不完整的，逐行 `try/catch` 容错。
+3. **去重思考**。同一 step 的多个工具调用会重复携带同一段 `providerData.reasoning`，
+   按 step 记录指纹，只保留第一次。
+
+#### 会话定位：必须认准 `data-root-id`，不能猜
+
+页面里**没有**现成的 sessionId 变量：`location.hash` 是空的，`workbuddyDesktop` 上也没有，
+React 把它存在内部 store 里拿不到。所以只能从 DOM 反推，而这里有个陷阱：
+
+| 选择器 | 能用吗 | 原因 |
+|---|---|---|
+| `.cr-message-list-viewport [data-root-id]` | ✅ 用这个 | 官方 `DocumentRenderer` 标记当前文档根，值就是会话 ID，**全局唯一**，切会话时跟着变 |
+| `[data-conversation-id]` | ❌ | 侧边栏**每个列表项**都有，拿到的是任意一个，不是当前打开的 |
+| 目录 mtime 最新的会话 | ❌ | 同时开两个会话时，另一个正在跑的那个才是最新写入的，会指错会话 |
+
+后两种做法在单会话时看起来都对，一旦多开就会串——面板显示的是别的会话的子代理，
+用户会以为是数据错乱。所以后端的规则是：
+
+- 前端传了 `sessionId` → **必须精确命中**，找不到直接 404 报错，绝不静默回退到别的会话；
+- 只有完全没传（老前端 / 手动调接口）才走 mtime 兜底，且响应里带 `guessed: true` 提示。
+
+面板每轮轮询都会重新读 `data-root-id`，发现会话变了就清掉展开状态并提示「会话已切换」，
+避免把上一个会话的子代理详情留在面板里。
+
+两个坑：
+
+- `reasoning` 记录的正文在 `rawContent` 里，是 `[{type:'reasoning_text', text}]` **数组**，
+  不是字符串。直接当字符串用会渲染出 `[object Object]`。
+- cwd 编码规则是 `H:/a/b` → `h-a-b`（盘符小写、冒号去掉）。**先去掉冒号再替换分隔符**，
+  否则会得到 `h--a-b`（多一个横杠）。
+
+### 界面
+
+点「子代理轨迹」→ 面板列出当前会话所有子代理（运行中的有绿点），点开看时间线：
+
+```
+任务：<委派给子代理的 prompt>
+思考 · step 1 · deepseek-v4.1-flash
+  <思考正文>
+Bash  21:09:55
+  echo "all-channel-4"
+结果 · Bash · completed
+  Stdout: all-channel-4
+```
+
+面板每 1.5s 轮询，运行中的子代理会实时增长。重绘前比对签名，内容没变就不动 DOM，所以滚动位置不会被打断。
+
+### 前提
+
+- 必须用 `wbpro up` / `wbpro inject` 启动（后端进程由它托管）。
+  **`wbpro reload` 单独跑不管用** —— 它是独立进程，通过控制服务触发重注入，
+  如果那个常驻的 wbpro 已经不在了，它仍会打印「已热更新」，但后端不会起来。
+- 后端只绑 `127.0.0.1`，端口每次启动随机分配。
 
 **模型列表从哪来（与官方选择器同源，不是自己筛的）**：官方渲染层是 `normalizeProductModels()` → `selectTeamsModelsByCliAgent()`，规则是
 
