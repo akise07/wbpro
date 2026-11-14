@@ -195,6 +195,9 @@ function activate(ctx) {
             title: '插件管理器',
             position: 'top-right',
             css: '.p{min-width:360px;}',
+            // 关键：持久化面板。热重载 / 切换插件时不销毁、复用同一节点，
+            // 否则「开关插件 → 管理器自己关掉」。
+            persist: true,
             onClose: function () {
                 panelRef = null;
                 setNavActive(false);
@@ -217,9 +220,14 @@ function activate(ctx) {
                 refresh.textContent = '热更新';
                 refresh.onclick = function () {
                     ctx.ui.toast('正在热更新…');
-                    ctx.control.reload().catch(function (e) {
-                        ctx.ui.toast('热更新失败: ' + e.message);
-                    });
+                    ctx.control
+                        .reload()
+                        .then(function () {
+                            setTimeout(load, 300);
+                        })
+                        .catch(function (e) {
+                            ctx.ui.toast('热更新失败: ' + e.message);
+                        });
                 };
                 head.appendChild(count);
                 head.appendChild(refresh);
@@ -266,6 +274,8 @@ function activate(ctx) {
                                     .toggle(plugin.id, checked)
                                     .then(function () {
                                         ctx.ui.toast((checked ? '已启用 ' : '已禁用 ') + plugin.name + '，正在热更新…');
+                                        // 热更新是差分的，面板本身不会重建，需要自己刷一次列表
+                                        setTimeout(load, 260);
                                     })
                                     .catch(function (e) {
                                         ctx.ui.toast('切换失败: ' + e.message);
@@ -367,11 +377,9 @@ function activate(ctx) {
     }, 1200);
     insertNav();
 
-    // 上次面板开着，重载后自动打开
+    // 上次面板开着：立即复用（persist 面板还在页面上，不会闪）
     if (ctx.storage.get('open', false)) {
-        setTimeout(function () {
-            if (!panelRef) openPanel();
-        }, 900);
+        openPanel();
     }
 
     ctx.log('插件管理器已加载');
@@ -380,7 +388,8 @@ function activate(ctx) {
         disposing = true;
         clearInterval(timer);
         removeNav();
-        if (panelRef) panelRef.remove();
+        // 持久化面板留给运行时复用；若插件被停用，运行时会回收它
+        if (panelRef && !panelRef.persist) panelRef.remove();
         panelRef = null;
     };
 }

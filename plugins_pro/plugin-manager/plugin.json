@@ -1,7 +1,7 @@
 {
   "id": "plugin-manager",
   "name": "插件管理器",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "在左侧栏「更多」下方加入插件管理入口：列表、启停、热更新",
   "renderer": "renderer.js",
   "system": true,

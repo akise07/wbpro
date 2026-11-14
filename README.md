@@ -159,7 +159,7 @@ function activate(ctx) {
 
 | 命名空间 | 方法 | 说明 |
 |---|---|---|
-| `ctx.ui` | `panel({title, render, position, css, closable, onClose})` | 浮动面板，Shadow DOM 隔离样式，可拖动；`onClose` 在面板销毁时回调 |
+| `ctx.ui` | `panel({title, render, position, css, closable, onClose, persist})` | 浮动面板，Shadow DOM 隔离样式，可拖动；`onClose` 在面板销毁时回调；`persist: true` 让面板在热重载后存活（复用同一节点） |
 | | `css(text)` | 注入全局样式，卸载时自动移除 |
 | | `toast(msg, ms)` | 轻提示 |
 | | `observe(fn, opts)` | MutationObserver 封装，用来嗅探界面结构 |
@@ -198,7 +198,19 @@ POST /api/open-dir                  → 资源管理器打开插件目录
 
 控制服务只绑 `127.0.0.1`，每次启动生成随机 token，注入页面时带上 `?t=<token>`，同机其他进程拿到端口也调不动。
 
-**为什么开关能立刻生效**：`enabled:false` 的插件在扫描阶段就被跳过（源码都不会被读进 bundle），改完文件后 CLI 重新构建 bundle 并 `Runtime.evaluate` 注入，新 bundle 会先 `__reset()` 卸载旧插件再挂载新的。整个过程不重启应用。
+**热更新是差分的**：`enabled:false` 的插件在扫描阶段就被跳过（源码都不进 bundle）；重新注入时 `__mount` 会先按 `sig` 比对每个插件（`sig` = 代码 + 清单 + 后端地址的 sha1 前 12 位），
+
+| 情况 | 行为 |
+|---|---|
+| 插件消失（被停用/删除） | 执行 `cleanup`，销毁它的面板与样式 |
+| `sig` 变了 | 卸载旧的，用新代码重新 `activate` |
+| `sig` 相同 | **原样保留**：不重跑代码、不动它的面板 DOM、不动它的样式 |
+
+所以开关某个插件时，插件管理器本身（代码没变）根本不会被重建，面板不闪、入口不闪、滚动位置也不丢。默认行为就是「谁变了才动谁」。
+
+**为什么管理器面板不会消失**：面板声明了 `persist: true`。插件被停用时 `__reset` 会保留这类面板、标记为未认领，若下一轮没人认领则由 `reclaimPanels()` 回收。插件仍在时反过来走「保留」路径，连复用都用不上——节点压根没被碰过。
+
+注意：`persist` 面板不会被自动加进卸载队列，插件自己的 `cleanup` 里也不要 `remove()` 它，否则又会「关了打不开」。
 
 ## 8. 为什么升级后还能用
 
@@ -220,7 +232,8 @@ POST /api/open-dir                  → 资源管理器打开插件目录
 5. **CSP 与 `new Function`**：注入的 bundle 不用 eval，插件源码是直接内联成函数体的，绕开 CSP 限制。插件里也不要自己用 `eval`。
 6. **后端插件推荐 `.cjs`**：`wbpro/package.json` 有 `"type": "module"`，同目录下的 `.js` 会被当 ESM 解析，`require` 会报错。
 7. **侧边栏入口靠文本定位**：`plugin-manager/renderer.js` 里 `ANCHOR_TEXTS = ['更多', 'More']`，官方如果改了导航文案，改这一行即可；万一整块结构大改，`findRow()` 会退回两层祖先，仍能插进去，只是位置可能偏。
-8. **改了 `runtime/bootstrap.js` 必须 +`RUNTIME_VERSION`**。页面里的 host 会一直活着，同版本号会走 early-return 复用旧对象，新加的 API（比如 `ctx.control`）不会生效，表现为「渲染失败: Cannot read properties of undefined」。当前版本 `0.3.0`。重启 wbpro 后会自动替换旧 host，不需要刷新页面。
+8. **改了 `runtime/bootstrap.js` 必须 +`RUNTIME_VERSION`**。页面里的 host 会一直活着，同版本号会走 early-return 复用旧对象，新加的 API（比如 `ctx.control`）不会生效，表现为「渲染失败: Cannot read properties of undefined」。当前版本 `0.5.0`。重启 wbpro 后会自动替换旧 host，不需要刷新页面。
+9. **升级运行时版本的那一次，面板会闪一下**。因为版本不同会走「整体替换旧 host」的路径，旧面板被销毁。这只是一次性的迁移代价；之后就进入差分模式，不再重建。想彻底避开，就让 `RUNTIME_VERSION` 保持不变、只改插件代码。
 9. **`--restart` 会杀掉自己**。跑在 WorkBuddy 自带终端里时，wbpro 是应用进程的后代，`taskkill /T /F` 会连它一起杀，重启后没人注入。所以这种情况会自动切后台接管（`cmd /c start` 制造孤儿进程，脱离进程树），日志在 `wbpro.log`。另外后台进程必须清掉 `NODE_OPTIONS` 和 `ELECTRON_RUN_AS_NODE`，否则会加载宿主 shim 或进入 Node 模式。
 
 ## 10. 能力边界

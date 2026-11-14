@@ -212,8 +212,8 @@ async function interactive() {
         const { plugins, errors, missing } = await loadPlugins(cfg.pluginsDir);
         if (missing) console.log(warn(`  插件目录不存在，已创建：${cfg.pluginsDir}`));
         for (const e of errors) console.log(bad(`  [跳过] ${e.dir}: ${e.reason}`));
-        backends?.stopAll();
-        const r = await loadAndInject({ injector, plugins, meta });
+        // 后端进程由 BackendHost 做差分复用，这里不能整体 stopAll
+        const r = await loadAndInject({ injector, plugins, meta, backends });
         backends = r.backends;
         const live = plugins.filter((p) => typeof p.code === 'string').length;
         console.log(`  ${ok('已注入')} ${live} 个 UI 插件 · ${r.sizeKb} KB · ${dim(reason)}`);
