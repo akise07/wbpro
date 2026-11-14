@@ -1,0 +1,7 @@
+{
+  "id": "cdp-guard",
+  "name": "CDP 端口守卫",
+  "version": "0.1.0",
+  "managed": true,
+  "description": "用 PreToolUse hook 硬拦截模型对 wbpro 调试端口的任何访问（无界面，纯后端约束）"
+}

@@ -313,6 +313,7 @@ async function interactive() {
 async function cmdUp() {
     banner();
     installDuoHooks();
+    installCdpGuardHook();
     const cfg = loadConfig();
     const port = Number(getOpt('--port', cfg.port));
     const wantRestart = has('--restart');
@@ -448,15 +449,126 @@ function installDuoHooks({ remove = false } = {}) {
     if (Object.keys(hooks).length) settings.hooks = hooks;
     else delete settings.hooks;
 
-    // 先写临时文件再 rename，避免写一半崩掉留下半截 JSON
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = `${file}.wbpro.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n', 'utf8');
-    fs.renameSync(tmp, file);
+    try {
+        writeSettingsFile(file, settings);
+    } catch (e) {
+        // settings.json 被宿主的文件保护策略覆盖（productSettings: write=ask），
+        // 沙箱里拿不到审批就会 EPERM。这里不能抛：一抛整个 demo/up 都中断，
+        // 用户只看到一坨堆栈却不知道要做什么。降级为一条可执行的指引。
+        console.log(bad(`  无法写入 ${path.basename(file)}（${e.code || e.message}）`));
+        console.log(dim('  该文件受宿主保护策略限制，需你本人批准后才能修改。'));
+        console.log(dim(`  在你自己的终端执行一次即可：node bin/wbpro.mjs hooks`));
+        return false;
+    }
 
     if (remove) console.log(ok(`  已移除主从路由 hook`));
     else if (existed) console.log(ok(`  已安装主从路由 hook → ${path.basename(file)}`));
     else console.log(ok(`  已创建 ${path.basename(file)} 并安装主从路由 hook`));
+    return true;
+}
+
+/**
+ * 写 settings.json：先落临时文件再 rename，避免写一半崩掉留下半截 JSON。
+ *
+ * Windows 上目标文件被别的进程打开时，rename 会 EPERM/EBUSY（实测 WorkBuddy
+ * 运行时可能持有 settings.json）。这种情况不能直接失败——那就永远装不上 hook——
+ * 退回就地覆盖：writeFileSync 能写被占用的文件，代价是失去原子性，
+ * 但这里写的是纯 JSON、体积很小，风险可接受。
+ */
+function writeSettingsFile(file, settings) {
+    const json = JSON.stringify(settings, null, 2) + '\n';
+    // 用唯一名：固定名会和上次失败残留的 tmp 撞车，那个文件可能正被别的进程占着
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, json, 'utf8');
+    try {
+        fs.renameSync(tmp, file);
+        return;
+    } catch (e) {
+        if (e.code !== 'EPERM' && e.code !== 'EBUSY' && e.code !== 'EACCES') throw e;
+        fs.writeFileSync(file, json, 'utf8');
+        try {
+            fs.unlinkSync(tmp);
+        } catch {
+            /* 残留的 tmp 无害，下次用别的名字 */
+        }
+        console.log(dim(`  提示：${path.basename(file)} 被占用（${e.code}），已改为就地写入`));
+    }
+}
+
+/**
+ * 安装 CDP 守卫 hook：硬拦截模型对调试端口的访问。
+ *
+ * 为什么必须是 hook 而不是写进规则：规则只是建议，模型会打折扣；
+ * PreToolUse 返回 permissionDecision:"deny" 是宿主层面的拒绝，工具根本不会执行。
+ *
+ * 这个守卫与协作模式无关，装了就一直在，所以单独一条、不跟 duo 的门控绑在一起。
+ * 幂等：先删掉含 cdp-guard 的旧条目再插。
+ */
+const CDP_GUARD_MATCHER = 'Bash|PowerShell|WebFetch|WebSearch';
+
+function cdpGuardCommand() {
+    const script = path.join(DEFAULT_PLUGINS_DIR, 'cdp-guard', 'hooks', 'no-cdp.mjs');
+    return `"${process.execPath}" "${script}"`;
+}
+
+function installCdpGuardHook({ remove = false } = {}) {
+    const file = path.join(os.homedir(), '.workbuddy', 'settings.json');
+    const script = path.join(DEFAULT_PLUGINS_DIR, 'cdp-guard', 'hooks', 'no-cdp.mjs');
+
+    if (!remove && !fs.existsSync(script)) {
+        console.log(dim(`  跳过 CDP 守卫：${script} 不存在（先装 cdp-guard 插件）`));
+        return false;
+    }
+
+    let settings;
+    let existed = true;
+    try {
+        const raw = fs.readFileSync(file, 'utf8');
+        settings = raw.trim() ? JSON.parse(raw) : {};
+    } catch (e) {
+        if (e.code === 'ENOENT') {
+            existed = false;
+            settings = {};
+        } else {
+            console.log(bad(`  跳过 CDP 守卫：${path.basename(file)} 无法解析（${e.message}）`));
+            return false;
+        }
+    }
+    if (settings === null || typeof settings !== 'object' || Array.isArray(settings)) {
+        console.log(bad(`  跳过 CDP 守卫：${path.basename(file)} 顶层不是对象`));
+        return false;
+    }
+
+    const hooks = settings.hooks && typeof settings.hooks === 'object' ? settings.hooks : {};
+    const list = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : [];
+    const kept = list.filter((g) => JSON.stringify(g).indexOf('cdp-guard') === -1);
+    if (!remove) {
+        kept.push({
+            matcher: CDP_GUARD_MATCHER,
+            hooks: [{ type: 'command', command: cdpGuardCommand(), timeout: 10 }],
+        });
+    }
+    if (kept.length) hooks.PreToolUse = kept;
+    else delete hooks.PreToolUse;
+    if (Object.keys(hooks).length) settings.hooks = hooks;
+    else delete settings.hooks;
+
+    try {
+        writeSettingsFile(file, settings);
+    } catch (e) {
+        // settings.json 被宿主的文件保护策略覆盖（productSettings: write=ask），
+        // 沙箱里拿不到审批就会 EPERM。这里不能抛：一抛整个 demo/up 都中断，
+        // 用户只看到一坨堆栈却不知道要做什么。降级为一条可执行的指引。
+        console.log(bad(`  无法写入 ${path.basename(file)}（${e.code || e.message}）`));
+        console.log(dim('  该文件受宿主保护策略限制，需你本人批准后才能修改。'));
+        console.log(dim(`  在你自己的终端执行一次即可：node bin/wbpro.mjs hooks`));
+        return false;
+    }
+
+    if (remove) console.log(ok('  已移除 CDP 守卫 hook'));
+    else if (existed) console.log(ok(`  已安装 CDP 守卫 hook → ${path.basename(file)}`));
+    else console.log(ok(`  已创建 ${path.basename(file)} 并安装 CDP 守卫 hook`));
     return true;
 }
 
@@ -543,6 +655,8 @@ async function cmdDemo() {
     console.log(dim(`  插件目录：${cfg.pluginsDir}`));
     // 只有真的装了 dual-model 才去动 settings.json
     if (dualModelSynced) installDuoHooks();
+    // 守卫与协作模式无关，装了就一直生效；脚本不存在时函数自己会跳过
+    installCdpGuardHook();
 }
 
 async function main() {
@@ -591,6 +705,7 @@ async function main() {
         case 'hooks': {
             banner();
             installDuoHooks({ remove: has('--remove') });
+            installCdpGuardHook({ remove: has('--remove') });
             return;
         }
         case 'inject': {
