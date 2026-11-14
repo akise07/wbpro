@@ -50,6 +50,10 @@ node bin/wbpro.mjs status     # 查看已激活插件
 node bin/wbpro.mjs list       # 列出插件目录
 ```
 
+**或者直接双击 `start.bat`**：自动定位 Node → 同步随包插件 → 带调试端口启动 → 注入 → 常驻（窗口开着别关）。
+
+`start.bat` 里的同步用的是 `demo --if-missing`：标记了 `system: true`（插件管理器）或 `managed: true`（随包示例）的插件**每次都会覆盖更新**，你自己建的插件目录不会被碰。
+
 已经开着 WorkBuddy 时：
 
 ```bash
@@ -91,7 +95,7 @@ wbpro/
 └─ plugins_pro/             示例插件（运行时会复制到用户目录）
    ├─ plugin-manager/       内置：左侧栏「插件管理」入口 + 列表/启停/热更新
    ├─ hello-panel/          浮动面板 + 宿主信息
-   ├─ dusk-theme/           纯 CSS 主题
+   ├─ dusk-theme/           整屏色调切换（暮色/冷夜/护眼/去色）
    └─ backend-echo/         自带 Node 后端进程
 ```
 

@@ -377,14 +377,16 @@ async function cmdDemo() {
         if (!fs.statSync(from).isDirectory()) continue;
         const to = path.join(cfg.pluginsDir, name);
 
-        let isSystem = false;
+        let syncAlways = false;
         try {
-            isSystem = JSON.parse(fs.readFileSync(path.join(from, 'plugin.json'), 'utf8')).system === true;
+            const m = JSON.parse(fs.readFileSync(path.join(from, 'plugin.json'), 'utf8'));
+            // 系统插件与随包发布的插件始终同步，避免管理器/示例停留在旧版
+            syncAlways = m.system === true || m.managed === true;
         } catch {
             /* 读不到就当普通插件 */
         }
 
-        if (ifMissing && fs.existsSync(to) && !isSystem) {
+        if (ifMissing && fs.existsSync(to) && !syncAlways) {
             console.log(`  ${dim('跳过')} ${name}（已存在）`);
             skipped++;
             continue;
