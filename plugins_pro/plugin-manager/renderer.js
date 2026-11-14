@@ -86,6 +86,7 @@ function stripActiveState(node) {
 
 function activate(ctx) {
     var panelRef = null;
+    var disposing = false; // 卸载流程中，不要把「打开状态」也清掉
     var navRef = null;
     var timer = null;
 
@@ -93,8 +94,21 @@ function activate(ctx) {
         [
             '[' + NAV_FLAG + ']{position:relative}',
             '[' + NAV_FLAG + '] *{cursor:pointer}',
+            // 面板打开时给入口一点高亮，跟官方导航的选中态风格保持一致
+            '[' + NAV_FLAG + '][data-wbpro-active]{background:rgba(127,119,221,.16);border-radius:8px}',
         ].join('\n'),
     );
+
+    // 入口高亮与面板状态同步
+    function setNavActive(on) {
+        if (!navRef) return;
+        try {
+            if (on) navRef.setAttribute('data-wbpro-active', '1');
+            else navRef.removeAttribute('data-wbpro-active');
+        } catch (e) {
+            /* nav 可能已被 React 移除 */
+        }
+    }
 
     /* ----- 列表渲染 ----- */
     function row(plugin, onChange) {
@@ -168,16 +182,25 @@ function activate(ctx) {
     }
 
     function openPanel() {
-        if (panelRef) {
+        // 只在「真的还在页面上」时复用；否则丢掉引用重建，避免出现两个面板
+        if (panelRef && panelRef.el && panelRef.el.isConnected) {
             panelRef.el.style.display = '';
+            setNavActive(true);
             return;
         }
+        panelRef = null;
         ctx.storage.set('open', true);
 
         panelRef = ctx.ui.panel({
             title: '插件管理器',
             position: 'top-right',
             css: '.p{min-width:360px;}',
+            onClose: function () {
+                panelRef = null;
+                setNavActive(false);
+                // 热重载导致的销毁不算「用户关闭」，保持打开状态
+                if (!disposing) ctx.storage.set('open', false);
+            },
             render: function (body) {
                 // 运行时可能是旧版本（页面没刷新），先给出可执行的提示而不是崩掉
                 if (!ctx.control) {
@@ -267,17 +290,16 @@ function activate(ctx) {
                 ctx.onCleanup(function () { clearInterval(poll); });
             },
         });
+        setNavActive(true);
+    }
 
-        // 面板被关掉时记住状态
-        var mo = new MutationObserver(function () {
-            if (!panelRef || !panelRef.el.isConnected) {
-                ctx.storage.set('open', false);
-                panelRef = null;
-                mo.disconnect();
-            }
-        });
-        mo.observe(document.body, { childList: true });
-        ctx.onCleanup(function () { mo.disconnect(); });
+    // 入口是开关：再点一次关闭面板
+    function togglePanel() {
+        if (panelRef && panelRef.el && panelRef.el.isConnected) {
+            panelRef.remove(); // 走统一销毁出口，onClose 里会清掉 panelRef 与高亮
+            return;
+        }
+        openPanel();
     }
 
     /* ----- 侧边栏入口 ----- */
@@ -321,11 +343,13 @@ function activate(ctx) {
         clone.addEventListener('click', function (e) {
             e.preventDefault();
             e.stopPropagation();
-            openPanel();
+            togglePanel();
         });
 
         rowEl.parentNode.insertBefore(clone, rowEl.nextSibling);
         navRef = clone;
+        // React 重建过导航时，把高亮状态补回来
+        setNavActive(!!(panelRef && panelRef.el && panelRef.el.isConnected));
         return true;
     }
 
@@ -353,6 +377,7 @@ function activate(ctx) {
     ctx.log('插件管理器已加载');
 
     return function () {
+        disposing = true;
         clearInterval(timer);
         removeNav();
         if (panelRef) panelRef.remove();

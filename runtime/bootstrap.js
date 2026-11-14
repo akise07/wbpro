@@ -8,7 +8,7 @@
     var Z = 2147483000;
     // 每次改动运行时能力都要 +1：版本不同会替换掉页面里的旧 host，
     // 否则旧 host 会因为下面的 early-return 一直占着位置，新 API（如 control）永远不生效。
-    var RUNTIME_VERSION = '0.2.0';
+    var RUNTIME_VERSION = '0.3.0';
 
     var prev = window[KEY];
     if (prev && prev.alive && prev.runtimeVersion === RUNTIME_VERSION) return;
@@ -30,7 +30,7 @@
     var host = {
         alive: true,
         runtimeVersion: RUNTIME_VERSION,
-        version: '0.2.0',
+        version: '0.3.0',
         plugins: new Map(),
         mounted: [], // 面板宿主节点，用于重挂
         log: [],
@@ -107,8 +107,27 @@
         shadow.appendChild(style);
         shadow.appendChild(card);
 
+        // 统一的销毁出口：必须走这里，否则 host.mounted 里留着已移除的节点，
+        // 保活定时器会在 2 秒后把它重新挂回 body（表现为「关了又自己打开」）。
+        var disposed = false;
+        var api = {
+            el: wrap,
+            body: body,
+            title: title,
+            remove: function () {
+                if (disposed) return;
+                disposed = true;
+                wrap.setAttribute('data-wbpro-closed', '1');
+                try { wrap.remove(); } catch (e) { /* ignore */ }
+                host.mounted = host.mounted.filter(function (n) { return n !== wrap; });
+                if (typeof opts.onClose === 'function') {
+                    try { opts.onClose(); } catch (e) { log('onClose 回调失败', opts.id, e); }
+                }
+            },
+        };
+
         close.addEventListener('click', function () {
-            wrap.remove();
+            api.remove();
         });
 
         // 拖动（指针事件，避免触发页面选中）
@@ -150,15 +169,7 @@
                 log('panel render 失败', opts.id, e);
             }
         }
-        return {
-            el: wrap,
-            body: body,
-            title: title,
-            remove: function () {
-                wrap.remove();
-                host.mounted = host.mounted.filter(function (n) { return n !== wrap; });
-            },
-        };
+        return api;
     }
 
     /* ---------------- 控制服务 ---------------- */
@@ -336,12 +347,14 @@
         if (document.body) run();
         else document.addEventListener('DOMContentLoaded', run, { once: true });
 
-        // 保活：SPA 若替换 body/根节点，把面板重新挂回
+        // 保活：SPA 若替换 body/根节点，把面板重新挂回（已关闭的不复活）
         if (!host.keeper) {
             host.keeper = setInterval(function () {
                 if (!document.body) return;
                 host.mounted.forEach(function (n) {
-                    if (!n.isConnected) document.body.appendChild(n);
+                    if (n.isConnected) return;
+                    if (n.hasAttribute && n.hasAttribute('data-wbpro-closed')) return;
+                    document.body.appendChild(n);
                 });
             }, 2000);
         }
