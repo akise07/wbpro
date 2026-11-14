@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
-import { listTargets, waitForCdp, waitForDomReady, waitForMainTarget } from '../lib/cdp.mjs';
+import { CDP, listTargets, pickMainTarget, waitForCdp, waitForDomReady, waitForMainTarget } from '../lib/cdp.mjs';
 import { DEFAULT_PLUGINS_DIR, loadPlugins, setPluginEnabled, watchPlugins } from '../lib/registry.mjs';
 import { appVersion, electronVersion, exePath, killAll, launch, loadConfig, loadPluginEnv, processCount } from '../lib/launcher.mjs';
 import { Injector, attach, loadAndInject } from '../lib/injector.mjs';
@@ -296,6 +296,7 @@ async function interactive() {
 
 async function cmdUp() {
     banner();
+    installDuoHooks();
     const cfg = loadConfig();
     const port = Number(getOpt('--port', cfg.port));
     const wantRestart = has('--restart');
@@ -364,6 +365,51 @@ async function cmdUp() {
 /** 把仓库里自带的示例插件复制到用户插件目录。
  *  默认覆盖；--if-missing 时跳过已存在的非系统插件（保护用户改动），
  *  系统插件（plugin-manager）始终同步，避免管理器停留在旧版。 */
+/**
+ * 把「主从路由」hook 装进 WorkBuddy 的 settings.json。
+ * 两个事件都指向同一个脚本，脚本自己读 runtime.json 判断是否处于协作模式：
+ *   UserPromptSubmit → 注入协作规则
+ *   PreToolUse(Agent) → 把子代理调用的 model 强制改成工作模型
+ * 幂等：先删掉自己以前写的条目再插，不会重复堆叠。
+ */
+const DUO_HOOK_EVENTS = ['UserPromptSubmit', 'PreToolUse', 'PostToolUse'];
+
+function duoHookCommand() {
+    const script = path.join(DEFAULT_PLUGINS_DIR, 'dual-model', 'hooks', 'router.mjs');
+    return `"${process.execPath}" "${script}"`;
+}
+
+function installDuoHooks({ remove = false } = {}) {
+    const file = path.join(os.homedir(), '.workbuddy', 'settings.json');
+    let settings = {};
+    try {
+        settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+        settings = {};
+    }
+    const hooks = settings.hooks && typeof settings.hooks === 'object' ? settings.hooks : {};
+    const marker = path.join(DEFAULT_PLUGINS_DIR, 'dual-model', 'hooks', 'router.mjs');
+
+    for (const ev of DUO_HOOK_EVENTS) {
+        const list = Array.isArray(hooks[ev]) ? hooks[ev] : [];
+        const kept = list.filter((g) => JSON.stringify(g).indexOf('dual-model') === -1 || JSON.stringify(g).indexOf('router.mjs') === -1);
+        if (!remove) {
+            kept.push({
+                matcher: ev === 'UserPromptSubmit' ? '*' : 'Agent',
+                hooks: [{ type: 'command', command: duoHookCommand(), timeout: 10 }],
+            });
+        }
+        if (kept.length) hooks[ev] = kept;
+        else delete hooks[ev];
+    }
+    if (Object.keys(hooks).length) settings.hooks = hooks;
+    else delete settings.hooks;
+
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n', 'utf8');
+    console.log(remove ? ok(`  已移除主从路由 hook`) : ok(`  已安装主从路由 hook → ${path.basename(file)}`));
+}
+
 async function cmdDemo() {
     banner();
     const cfg = loadConfig();
@@ -414,6 +460,7 @@ async function cmdDemo() {
     if (skipped) console.log(dim(`\n  ${copied} 个已同步，${skipped} 个已存在跳过（--if-missing）`));
     else console.log(dim(`\n  ${copied} 个插件已就位`));
     console.log(dim(`  插件目录：${cfg.pluginsDir}`));
+    installDuoHooks();
 }
 
 async function main() {
@@ -430,6 +477,40 @@ async function main() {
             return cmdStatus();
         case 'doctor':
             return cmdDoctor();
+        case 'reload': {
+            // 插件改完不想重启应用：让页面里的宿主重新拉一遍 plugins_pro 并热替换
+            const cfg = loadConfig();
+            if (!(await cdpAlive(cfg.port))) {
+                console.log(bad(`  CDP 未开启，先执行 wbpro up`));
+                return;
+            }
+            const target = pickMainTarget(await listTargets(cfg.port));
+            const client = await CDP.attach(target);
+            try {
+                const meta = await client.eval('window.__wbpro && window.__wbpro.meta');
+                if (!meta || !meta.controlUrl) {
+                    console.log(bad(`  页面里没有 wbpro 宿主，先执行 wbpro up`));
+                    return;
+                }
+                const res = await fetch(`${meta.controlUrl}/api/reload?t=${meta.controlToken}`, { method: 'POST' });
+                const body = await res.json().catch(() => ({}));
+                if (!body.ok) throw new Error(`控制服务返回 ${res.status}`);
+                await sleep(1200);
+                const st = await client.eval('window.__wbpro.status()');
+                console.log(ok(`  已热更新`));
+                for (const p of st?.plugins || []) {
+                    console.log(dim(`    ${p.id.padEnd(16)} ${p.version}${p.error ? '  ✗ ' + p.error : ''}`));
+                }
+            } finally {
+                client.close();
+            }
+            return;
+        }
+        case 'hooks': {
+            banner();
+            installDuoHooks({ remove: has('--remove') });
+            return;
+        }
         case 'inject': {
             const cfg = loadConfig();
             if (!(await cdpAlive(cfg.port))) {
@@ -440,7 +521,7 @@ async function main() {
             return interactive();
         }
         default:
-            console.log(`未知命令: ${cmd}\n可用: up | status | list | doctor | inject`);
+            console.log(`未知命令: ${cmd}\n可用: up | status | list | doctor | reload | hooks | inject`);
     }
 }
 

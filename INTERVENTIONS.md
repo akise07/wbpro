@@ -28,6 +28,52 @@
 
 开启方式：`WORKBUDDY_REMOTE_DEBUGGING_PORT`（源码里的隐藏开关，无生产限制）。
 
+### 1.2 按「每次调用」换模型：Agent 工具的 model + PreToolUse（5.9.3 实测）
+
+官方唯一能"这一次调用用别的模型"的入口，是 `Agent`（子代理）工具的入参 `model`：
+
+```
+Agent({ description, prompt, subagent_type, model: "deepseek-v4.1-flash" })
+```
+
+CLI 侧 `resolveAgentModel(t)` 解析顺序：**env `CODEBUDDY_CODE_SUBAGENT_MODEL` > 调用参数 `model` > agent 定义**。
+所以想按次控制，必须**不要**注入那个 env。
+
+配套两条真机验证过的注入通道（都热生效，不用重启）：
+
+| 通道 | 位置 | 用途 | 验证 |
+|---|---|---|---|
+| 规则文件 | `~/.workbuddy/rules/*.md` | 常驻指令，随会话注入 | 写 `RULE-ALPHA`，模型回复里能原样复述 ✅ |
+| Hook | `~/.workbuddy/settings.json` → `hooks.<Event>` | 改工具入参 / 注入上下文 | `UserPromptSubmit` 注入 `HOOK-BETA` 出现在上下文 ✅；`PreToolUse`(matcher=`Agent`) 改写 `model`，日志确认 ✅ |
+
+`settings.json` 的 hook 形状（`matcher` 对 `PreToolUse` 是工具名，`*` 匹配全部）：
+
+```jsonc
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "matcher": "*", "hooks": [{ "type": "command", "command": ""node.exe" "...\\router.mjs"", "timeout": 10 }] }],
+    "PreToolUse":       [{ "matcher": "Agent", "hooks": [{ "type": "command", "command": "...同上..." }] }]
+  }
+}
+```
+
+`dual-model` 插件就是靠这套做的：`UserPromptSubmit` 注入"执行必须委派"的规则，
+`PreToolUse(Agent)` 把 `model` 强改成工作模型，状态从 `runtime.json` 现读，改完下一次调用即生效。
+
+## 1.1 换模型：IPC 是假的，只能点下拉（5.9.3 实测）
+
+| 方式 | 返回 | 实际效果 |
+|---|---|---|
+| `__wbInvoke('session:setModel', {sessionId, modelId})` | `{success:true}` | ✗ 下一条消息仍用旧模型 |
+| `workbuddyDesktop.setSessionModel(...)` | 对象/`unsupported` | ✗ 本版本没有该方法 |
+| 点 `.cr-model-selector__list` 里对应项 | React `onSelect` | ✅ 真实切换 |
+
+原因：官方切换完全发生在渲染层 —— 下拉项 onClick → 输入框 store `api.setModel(selection)` →
+`onChange` → 发送时 `ensureSessionModelBeforeSend` / `resolveAndSyncSessionModel` 才把模型同步进
+ACP 会话；`session:setModel` 只改了主进程里的会话记录，没有通知跑 Agent 的 ACP 连接。
+验证方式：点完看触发器 `aria-label` 是否变成 `Select model: <名称>`，以及会话 jsonl 里
+`"model"` 字段（`~/.workbuddy/projects/<cwd>/<session>.jsonl`）。
+
 ## 2. 协议层（ACP / JSON-RPC）
 
 | 方法 | 能做什么 | 谁能发 | 稳定性 |
@@ -131,6 +177,6 @@
 | 加一段固定流程 | Skill |
 | 加界面/侧栏/面板 | wbpro CDP 注入 |
 | 省 token | 调压缩阈值、精简 `CODEBUDDY.md`、关掉不用的 MCP 工具 |
-| 换模型/换模式 | `settings.json` 或 `session/set_model` |
+| 换模型/换模式 | **必须点官方模型下拉项**（渲染层 store → 发送时同步给 ACP）；`session:setModel`/`setSessionModel` 走 IPC 是假成功 |
 | 跑更久 | `CODEBUDDY_CODE_MAX_TURNS` |
 | 中途改变它的方向 | `session/steer` 或 hook `additionalContext` |

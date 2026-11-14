@@ -46,6 +46,7 @@ cd wbpro
 node bin/wbpro.mjs doctor     # 环境体检
 node bin/wbpro.mjs demo       # 把示例插件复制到 ~/.workbuddy/plugins_pro
 node bin/wbpro.mjs up         # 启动 WorkBuddy 并注入（用这个方式启动才有插件）
+node bin/wbpro.mjs reload     # 改了插件不想重启应用：热替换一遍
 node bin/wbpro.mjs status     # 查看已激活插件
 node bin/wbpro.mjs list       # 列出插件目录
 ```
@@ -217,22 +218,64 @@ POST /api/open-dir                  → 资源管理器打开插件目录
 
 主模型负责决策与验收，工作模型负责执行，界面上实时显示当前阶段由谁负责。
 
+**它是一个「档位」，不是开关**：模型选择器顶部多出一项 `⇄ 主从模型`（克隆官方行，样式自动继承）。选中后它就像官方模型一样成为**当前档位**——
+
+| 位置 | 选中「主从模型」后 |
+|---|---|
+| 输入框上方触发器 | 标签变成 `⇄ 主从模型`（图标也换），提示里带 `主 xxx / 工 xxx` |
+| 下拉列表 | 勾选落在「主从模型」上，真实模型那一项的勾选隐藏（用 `html.wbpro-duo-mode` 下的 CSS） |
+| 再次点它 | 什么都不做（等同点已选中的模型），不会关掉 |
+| 点别的模型 | 立刻切回那个模型，协作档位退出、状态条移除 |
+
+关闭路径只有两条：选别的模型，或在面板里点「关闭」。
+
+**状态显示在对话流里**，不是面板：`.cr-message-list` 内注入一条 `position: sticky; bottom: 8px` 的胶囊，内容随阶段变化——
+
+| 阶段 | 状态条 |
+|---|---|
+| 决策 | `● 主模型 Hy4 · 决策 / 验收`（紫点） |
+| 执行 | `● 工作模型 xxx · 执行中`（绿点） |
+| 待命 | `● 主从协作 · 待命`（灰点） |
+
+点击状态条直接打开设置面板。React 重渲染会把它冲掉，所以有 2s 兜底补挂；插件卸载时会一并清掉下拉项与状态条。
+
+**为什么用克隆而不是写死样式**：官方选项行的类名是 `cr-model-selector__item` 这类语义类，但内部结构（图标 SVG、倍率、角标、勾选）随时可能变。克隆第一行再替换文字/图标，能跟着官方一起变；`.cr-model-selector__list` 找不到时自动跳过，不影响其它功能。
+
 **两个模型走的是两条完全不同的通道**，这是关键：
 
 | 角色 | 通道 | 生效时机 |
 |---|---|---|
-| 主模型 | `session:setModel`（当前会话模型） | 点保存后立即 |
-| 工作模型 | `CODEBUDDY_CODE_SUBAGENT_MODEL`（子代理模型） | 重启 WorkBuddy |
+| 主模型 | **点官方模型下拉项**（渲染层 store → `onChange`） | 下一次发送时同步给 ACP 会话 |
+| 工作模型 | **hook 改写 `Agent` 工具入参的 `model`**（`PreToolUse.updatedInput`） | 每一次子代理调用，改完即生效 |
 
-工作模型为什么必须重启？因为子代理的模型由 CLI 启动时读取环境变量决定（`resolveAgentModel` 里 `process.env.CODEBUDDY_CODE_SUBAGENT_MODEL` 优先），而渲染层改不了已经跑起来的 CLI 进程。
+**主模型为什么不能走 IPC**（5.9.3 实测）：`__wbInvoke('session:setModel', {sessionId, modelId})` 会老老实实返回 `{success:true}`，
+但下一条消息仍然是旧模型——它只改了主进程里的会话记录，没通知真正跑 Agent 的 ACP 连接。官方切换完全在渲染层：
+下拉项 `onClick` → 输入框 store `api.setModel(selection)` → `onChange` → 发送前 `ensureSessionModelBeforeSend` 才同步进会话。
+所以插件改成「展开下拉 → 点在那个真实档位上」，点完用触发器的 `aria-label`（`Select model: xxx`）复核，
+没变就报错，不再假成功。
+
+**工作模型为什么不走环境变量**：CLI 的 `resolveAgentModel()` 是 **env 优先于调用参数**——
+`CODEBUDDY_CODE_SUBAGENT_MODEL` 一旦注入，`Agent` 工具里的 `model` 就被忽略，改模型还得重启。
+所以 `loadPluginEnv()` 故意不再注入它，改由 `plugins_pro/dual-model/hooks/router.mjs` 在每次
+`PreToolUse`（matcher=`Agent`）里读 `runtime.json`，用 `updatedInput` 把 `model` 强制改成工作模型。
+好处：面板里改完工作模型，**下一次委派直接生效**，不用重启。
+
+同一个 hook 还在 `UserPromptSubmit` 里注入协作规则（只在协作档位开启时），所以不用再手工往
+`CODEBUDDY.md` 里粘规则。hook 装在 `~/.workbuddy/settings.json` 的 `hooks` 字段，由 `wbpro up` /
+`demo` 自动安装（`node bin/wbpro.mjs hooks` 手动装，`hooks --remove` 卸掉）。
 
 **使用流程**
 
-1. 点右下角浮标 → 面板
+1. 点右下角浮标 → 面板（或直接在模型下拉里选「主从模型」）
 2. 选主模型、工作模型、执行轮次 → 保存
-3. 首次设置工作模型后，重启一次（`wbpro up --restart --yes`）
-4. 点「复制协同规则」，粘到项目 `CODEBUDDY.md` 末尾
-5. 之后每次对话，浮标会显示「主 xxx · 决策」或「工 xxx · 执行中」
+3. 打开模型下拉，最上面就是「⇄ 主从模型」档位——选中它，当前会话会立刻切到主模型（顶部触发器显示「主从模型」，真实模型名藏在下面）
+4. 之后对话里：主线调用走主模型，凡是委派给子代理的执行步骤自动走工作模型；对话流胶囊显示当前阶段
+5. 想换模型：主模型直接在下拉里点，工作模型在面板里改——都是下一次调用生效
+
+> 从旧版升级：如果之前被注入过 `CODEBUDDY_CODE_SUBAGENT_MODEL`（旧版 `wbpro` 会设），
+> 需要重启一次应用把 env 清掉，之后才能享受"改完即生效"。
+
+想换回普通档位：下拉里点任意真实模型即可退出协作（会把标签交还给 React，不会卡在「主从模型」）。
 
 **模型列表从哪来（与官方选择器同源，不是自己筛的）**：官方渲染层是 `normalizeProductModels()` → `selectTeamsModelsByCliAgent()`，规则是
 

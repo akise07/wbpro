@@ -1,9 +1,12 @@
 /* 双模型协同：主模型决策 + 工作模型执行，并在界面上标出当前阶段。
  *
  * 两个模型的分工靠两条不同的通道：
- *   主模型 —— 当前会话模型，用 session:setModel 即时切换
- *   工作模型 —— 子代理模型，CLI 启动时读 CODEBUDDY_CODE_SUBAGENT_MODEL，
- *               所以只能写进 runtime.json，由 wbpro 下次启动时注入
+ *   主模型 —— 当前会话模型。**只能通过点官方模型下拉项来切换**（见 applyMainModel 注释）；
+ *             IPC 的 session:setModel / workbuddyDesktop.setSessionModel 都会"成功"返回，
+ *             但实际请求还是旧模型，是假的。
+ *   工作模型 —— 子代理模型。由 wbpro 装的 hook（hooks/router.mjs）在**每次 Agent 调用**时
+ *               用 PreToolUse.updatedInput 强塞 model，所以改完下一次委派就生效，不用重启。
+ *               （不能用 CODEBUDDY_CODE_SUBAGENT_MODEL：CLI 里 env 优先级高于调用参数）
  */
 var PLUGIN_ID = 'dual-model';
 var COOP_RULES = [
@@ -100,12 +103,14 @@ function activate(ctx) {
         workerMaxTurns: 0,
         phase: 'idle',
         auto: true,
+        duo: false, // 是否处于「主从模型」协作模式
     };
     var panelRef = null;
     var badge = null;
     var badgeText = null;
     var probe = { desktop: false, setModel: false, invoke: false, onEvent: false };
     var lastApply = '';
+    var syncingMain = false; // 正在用脚本点官方模型项，期间不要当成"用户切走档位"
     var modelList = BUILTIN_MODELS.slice();
 
     function byId(id) {
@@ -131,6 +136,7 @@ function activate(ctx) {
         state.phase = p;
         renderBadge();
         renderPhaseRow();
+        renderChip();
     }
 
     function currentOwner() {
@@ -167,12 +173,364 @@ function activate(ctx) {
         var d = document.createElement('span');
         d.style.cssText = 'width:6px;height:6px;border-radius:50%;background:' + dot + ';flex:none';
         var t = document.createElement('span');
-        t.textContent = (isWork ? '工 ' : '主 ') + shortName(currentOwner()) + ' · ' + PHASES[state.phase].label;
+        t.textContent =
+            (state.duo ? '\u21c4 ' : '') +
+            (isWork ? '工 ' : '主 ') +
+            shortName(currentOwner()) +
+            ' · ' +
+            PHASES[state.phase].label;
         t.style.cssText = 'max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
         badge.appendChild(d);
         badge.appendChild(t);
         badgeText = t;
         badge.title = '双模型协同：点击设置';
+    }
+
+
+    /* ---------- 模型下拉里的「主从模型」 ---------- */
+
+    var MENU_LIST = '.cr-model-selector__list';
+    var MENU_ITEM = '.cr-model-selector__item';
+    var MENU_FLAG = 'data-wbpro-duo-item';
+    var MSG_LIST = '.cr-message-list';
+    var CHIP_FLAG = 'data-wbpro-duo-chip';
+
+    var menuObserver = null;
+    var menuTimer = null;
+    var chipTimer = null;
+    var menuGuardTimer = null; // 下拉被 React 重渲染冲掉时补回协作项
+
+    function closeModelPopover() {
+        var open = document.querySelector('.cr-model-selector__trigger--open');
+        if (open) {
+            open.click();
+            return;
+        }
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    }
+
+    /** 克隆官方第一项，只换图标/标题/右侧文字，样式全部继承 */
+    function buildDuoRow(list) {
+        var sample = null;
+        for (var i = 0; i < list.children.length; i++) {
+            var c = list.children[i];
+            if (c.getAttribute && c.getAttribute(MENU_FLAG)) continue;
+            if ((c.matches && c.matches(MENU_ITEM)) || (c.querySelector && c.querySelector(MENU_ITEM))) {
+                sample = c;
+                break;
+            }
+        }
+        if (!sample) return null;
+
+        var row = sample.cloneNode(true);
+        row.setAttribute(MENU_FLAG, '1');
+        var item = row.matches && row.matches(MENU_ITEM) ? row : row.querySelector(MENU_ITEM);
+        if (!item) return null;
+
+        var icon = item.querySelector('.cr-model-selector__item-icon');
+        if (icon) {
+            icon.innerHTML =
+                '<span style="display:inline-flex;align-items:center;justify-content:center;' +
+                'width:16px;height:16px;font-size:13px;line-height:1;color:currentColor">\u21c4</span>';
+        }
+        var name = item.querySelector('.cr-model-selector__item-name');
+        if (name) name.textContent = '主从模型';
+
+        var credits = item.querySelector('.cr-model-selector__item-credits');
+        if (credits) credits.textContent = state.duo ? '已启用' : '协作';
+
+        ['.cr-model-selector__item-badge', '.cr-model-selector__tier-badge'].forEach(function (sel) {
+            var n = item.querySelector(sel);
+            if (n) n.remove();
+        });
+        var check = item.querySelector('.cr-model-selector__item-check');
+        if (check) check.style.visibility = state.duo ? 'visible' : 'hidden';
+
+        item.setAttribute('aria-selected', state.duo ? 'true' : 'false');
+        if (state.duo) item.classList.add('cr-model-selector__item--selected');
+
+        row.addEventListener(
+            'click',
+            function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                // 当作一个正式档位：已经是它就收起下拉，只有选别的模型才切走
+                if (state.duo) {
+                    closeModelPopover();
+                    return;
+                }
+                // 下拉此刻是展开的，setDuo 会顺手点在同主模型的官方项上（点完 React 自己收起）
+                setDuo(true);
+            },
+            true,
+        );
+        return row;
+    }
+
+    /** 协作档位激活时，让顶部触发器显示「⇄ 主从模型」。
+     *  注意：不能改 React 那个 label 的文本 —— 我们改了它，React 的 vdom 仍记着旧值，
+     *  等用户切回真实档位时它不会重写文本，标签就永远卡在"主从模型"。
+     *  正确做法是把它藏起来，另外插一个自己的节点；退出时删掉自己的、露出官方的。
+     */
+    var DUO_LABEL_ATTR = 'data-wbpro-duo-label';
+    var DUO_ICON_ATTR = 'data-wbpro-duo-icon';
+
+    function applyTriggerLabel() {
+        var trig = document.querySelector('.cr-model-selector__trigger');
+        if (!trig) return;
+        var label = trig.querySelector('.cr-model-selector__trigger-label');
+        var icon = trig.querySelector('.cr-model-selector__trigger-icon');
+        if (!label) return;
+
+        if (state.duo) {
+            if (label.style.display !== 'none') label.style.display = 'none';
+            var mine = trig.querySelector('[' + DUO_LABEL_ATTR + ']');
+            if (!mine && label.parentNode) {
+                mine = document.createElement('span');
+                mine.setAttribute(DUO_LABEL_ATTR, '1');
+                mine.textContent = '主从模型';
+                mine.style.cssText =
+                    'max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+                label.parentNode.insertBefore(mine, label.nextSibling);
+            }
+            if (icon) {
+                if (icon.style.display !== 'none') icon.style.display = 'none';
+                if (!trig.querySelector('[' + DUO_ICON_ATTR + ']') && icon.parentNode) {
+                    var mi = document.createElement('span');
+                    mi.setAttribute(DUO_ICON_ATTR, '1');
+                    mi.textContent = '\u21c4';
+                    mi.style.cssText =
+                        'display:inline-flex;align-items:center;justify-content:center;' +
+                        'width:16px;height:16px;font-size:13px;line-height:1;color:currentColor';
+                    icon.parentNode.insertBefore(mi, icon);
+                }
+            }
+            trig.setAttribute('data-wbpro-duo-active', '1');
+            trig.title =
+                '当前档位：主从模型（主 ' + shortName(state.mainModel) + ' / 工 ' + shortName(state.workerModel) + '）';
+        } else {
+            trig.removeAttribute('data-wbpro-duo-active');
+            trig.removeAttribute('title');
+            var l2 = trig.querySelector('[' + DUO_LABEL_ATTR + ']');
+            if (l2) l2.remove();
+            var i2 = trig.querySelector('[' + DUO_ICON_ATTR + ']');
+            if (i2) i2.remove();
+            if (label.style.display === 'none') label.style.display = '';
+            if (icon && icon.style.display === 'none') icon.style.display = '';
+        }
+    }
+
+    function ensureDuoRow() {
+        var list = document.querySelector(MENU_LIST);
+        if (!list) return;
+        var mine = list.querySelector('[' + MENU_FLAG + ']');
+        if (mine) {
+            // 打开态可能变化，刷新一下右侧文字与勾选
+            var c = mine.querySelector('.cr-model-selector__item-credits');
+            if (c) c.textContent = state.duo ? '已启用' : '协作';
+            return;
+        }
+        var row = buildDuoRow(list);
+        if (row) list.insertBefore(row, list.firstChild);
+    }
+
+    /** 用户在下拉里点了真实模型 → 退出协作模式 */
+    function onDocClickCapture(e) {
+        if (syncingMain) return; // 我们自己点官方档位，不算用户切走
+        var t = e.target;
+        if (!t || !t.closest) return;
+        var item = t.closest(MENU_ITEM);
+        if (!item) return;
+        if (item.closest('[' + MENU_FLAG + ']')) return;
+        if (state.duo) setDuo(false, true);
+    }
+
+    /* ---------- 对话流里的阶段状态条 ---------- */
+
+    function renderChip() {
+        var existing = document.querySelector('[' + CHIP_FLAG + ']');
+        if (!state.duo) {
+            if (existing) existing.remove();
+            return;
+        }
+        var list = document.querySelector(MSG_LIST);
+        if (!list) return;
+
+        var chip = existing;
+        if (!chip) {
+            chip = document.createElement('div');
+            chip.setAttribute(CHIP_FLAG, '1');
+            chip.style.cssText = [
+                'position:sticky',
+                'bottom:8px',
+                'margin:6px auto 2px',
+                'max-width:max-content',
+                'display:flex',
+                'align-items:center',
+                'gap:6px',
+                'padding:4px 10px',
+                'border-radius:999px',
+                'background:rgba(28,28,32,.9)',
+                'color:#e9e9ec',
+                'border:1px solid rgba(255,255,255,.16)',
+                'font:11px/1.5 system-ui,-apple-system,sans-serif',
+                'box-shadow:0 2px 10px rgba(0,0,0,.28)',
+                'z-index:6',
+                'cursor:pointer',
+                'user-select:none',
+            ].join(';');
+            chip.title = '主从模型协作中：点击打开设置';
+            chip.addEventListener('click', function () {
+                if (!panelRef) openPanel();
+            });
+        }
+        if (chip.parentNode !== list) list.appendChild(chip);
+
+        var isWork = state.phase === 'working';
+        var dot = isWork ? '#5DCAA5' : state.phase === 'idle' ? '#8a8a92' : '#7F77DD';
+        var label =
+            state.phase === 'idle'
+                ? '主从协作 · 待命'
+                : (isWork ? '工作模型 ' : '主模型 ') + shortName(currentOwner()) + ' · ' + PHASES[state.phase].hint;
+
+        chip.textContent = '';
+        var d = document.createElement('span');
+        d.style.cssText = 'width:6px;height:6px;border-radius:50%;flex:none;background:' + dot;
+        var t = document.createElement('span');
+        t.textContent = label;
+        chip.appendChild(d);
+        chip.appendChild(t);
+    }
+
+    function installDuoUI() {
+        // 协作档位激活时，真实模型那一项不该再显示勾选（它已不是"当前模型"）
+        try {
+            ctx.ui.css(
+                [
+                    'html.wbpro-duo-mode .cr-model-selector__list .cr-model-selector__item .cr-model-selector__item-check{visibility:hidden}',
+                    'html.wbpro-duo-mode [data-wbpro-duo-item] .cr-model-selector__item-check{visibility:visible}',
+                ].join('\n'),
+            );
+        } catch (e) {
+            ctx.log('注入样式失败', e);
+        }
+        if (!menuObserver) {
+            menuObserver = new MutationObserver(function () {
+                if (menuTimer) return;
+                menuTimer = setTimeout(function () {
+                    menuTimer = null;
+                    if (state.duo || document.querySelector(MENU_LIST)) ensureDuoRow();
+                    applyTriggerLabel();
+                    if (state.duo) renderChip();
+                }, 120);
+            });
+            menuObserver.observe(document.body, { childList: true, subtree: true });
+        }
+        document.addEventListener('click', onDocClickCapture, true);
+        // 点开下拉时立刻补几次，别等 800ms 兜底
+        document.addEventListener(
+            'click',
+            function (e) {
+                var t = e.target;
+                if (!t || !t.closest || !t.closest('.cr-model-selector__trigger')) return;
+                [60, 200, 420].forEach(function (ms) {
+                    setTimeout(function () {
+                        if (document.querySelector(MENU_LIST)) ensureDuoRow();
+                    }, ms);
+                });
+            },
+            true,
+        );
+        // 下拉每次打开都可能被 React 重建，MutationObserver 有 120ms 节流，
+        // 这里再加一层低频兜底，保证「主从模型」不会因为时机问题消失
+        if (!menuGuardTimer) {
+            menuGuardTimer = setInterval(function () {
+                if (!document.querySelector(MENU_LIST)) return;
+                ensureDuoRow();
+                applyTriggerLabel();
+            }, 800);
+        }
+        // React 重渲染可能把状态条冲掉，兜一层
+        if (!chipTimer) {
+            chipTimer = setInterval(function () {
+                if (!state.duo) return;
+                if (!document.querySelector('[' + CHIP_FLAG + ']')) renderChip();
+            }, 2000);
+        }
+        // 重载后如果仍是协作模式，默认落在「决策」阶段，而不是待命
+        if (state.duo && state.phase === 'idle') state.phase = 'planning';
+        try { ensureDuoRow(); } catch (e) { window.__duoRowErr = String((e && e.stack) || e); }
+        applyTriggerLabel();
+        document.documentElement.classList.toggle('wbpro-duo-mode', state.duo);
+        renderChip();
+        // 重启后配置仍是协作档位：官方模型可能已回到默认，静默对齐一次
+        if (state.duo && state.mainModel) syncMainModelOnce();
+    }
+
+    var duoSyncTried = false;
+
+    function syncMainModelOnce() {
+        if (duoSyncTried) return;
+        duoSyncTried = true;
+        setTimeout(function () {
+            if (!state.duo || !state.mainModel) return;
+            // 模型表还没拉到就先别比，免得按 id 误判
+            if (!byId(state.mainModel)) {
+                applyTriggerLabel();
+                return;
+            }
+            var cur = officialLabel();
+            if (!cur || cur === '主从模型' || cur === shortName(state.mainModel)) {
+                applyTriggerLabel();
+                return;
+            }
+            applyMainModel(state.mainModel).then(function (r) {
+                ctx.log('启动时对齐主模型', r.detail);
+                applyTriggerLabel();
+            });
+        }, 1200);
+    }
+
+    function setDuo(on, silent) {
+        state.duo = !!on;
+        if (state.duo) {
+            if (state.phase === 'idle') state.phase = 'planning';
+            // 没配主模型就沿用当前官方档位，别让"主从模型"变成空壳
+            if (!state.mainModel) {
+                var cur = idByLabel(officialLabel());
+                if (cur) {
+                    state.mainModel = cur;
+                    saveConfig({ mainModel: cur });
+                }
+            }
+        } else if (state.phase !== 'idle') {
+            state.phase = 'idle';
+        }
+        renderBadge();
+        renderChip();
+        renderPhaseRow();
+        ensureDuoRow();
+        applyTriggerLabel();
+        startPhasePoll();
+        document.documentElement.classList.toggle('wbpro-duo-mode', state.duo);
+        saveConfig({ duo: state.duo });
+
+        if (state.duo && state.mainModel) {
+            // 真正把当前会话切到主模型（点官方下拉项）
+            applyMainModel(state.mainModel).then(function (r) {
+                if (document.querySelector(MENU_LIST)) closeModelPopover();
+                applyTriggerLabel();
+                if (!r.ok && !silent) ctx.ui.toast('主从模型已开启，但主模型没切过去：' + r.detail);
+            });
+        }
+
+        if (!silent) {
+            ctx.ui.toast(
+                state.duo
+                    ? '主从模型已开启' + (state.mainModel ? '：' + shortName(state.mainModel) : '；请先在面板里指定主模型')
+                    : '已退出主从模式',
+            );
+        }
     }
 
     /* ---------- 自检 ---------- */
@@ -406,6 +764,7 @@ function activate(ctx) {
         if (typeof c.workerModel === 'string') state.workerModel = c.workerModel;
         if (typeof c.workerMaxTurns === 'number') state.workerMaxTurns = c.workerMaxTurns;
         if (typeof c.auto === 'boolean') state.auto = c.auto;
+        if (typeof c.duo === 'boolean') state.duo = c.duo;
     }
 
     /** 本地有未同步的改动时，下次连上控制服务就补写 runtime.json */
@@ -489,59 +848,142 @@ function activate(ctx) {
 
     /* ---------- 切换主模型 ---------- */
 
-    // 官方没有导出「设置模型」的公开方法，这里按可信度依次试三种形态。
+    // 实测 5.9.3：`__wbInvoke('session:setModel', …)`、`workbuddyDesktop.setSessionModel(…)`
+    // 都会返回成功（甚至还带 {success:true}），但**下一条消息仍用旧模型**——
+    // 那条通道只改了主进程里的会话记录，没有通知真正跑 Agent 的 ACP 会话。
+    //
+    // 官方切换完全发生在渲染层：下拉项 onClick → 输入框 store.setModel(selection)
+    // → onChange → 发送时 resolveAndSyncSessionModel/ensureSessionModelBeforeSend 才把
+    // 模型同步进 ACP 会话。所以我们唯一的可靠做法是：把下拉展开，点在那个真实档位上。
+
+    function menuItems() {
+        var list = document.querySelector(MENU_LIST);
+        if (!list) return [];
+        var all = list.querySelectorAll(MENU_ITEM);
+        var out = [];
+        for (var i = 0; i < all.length; i++) {
+            if (all[i].closest && all[i].closest('[' + MENU_FLAG + ']')) continue; // 跳过我们自己那行
+            out.push(all[i]);
+        }
+        return out;
+    }
+
+    function itemName(el) {
+        var n = el.querySelector('.cr-model-selector__item-name');
+        return n ? String(n.textContent || '').trim() : '';
+    }
+
+    function findMenuItem(modelId) {
+        var want = shortName(modelId);
+        var keys = [want, modelId];
+        var items = menuItems();
+        for (var k = 0; k < keys.length; k++) {
+            if (!keys[k]) continue;
+            for (var i = 0; i < items.length; i++) {
+                if (itemName(items[i]) === keys[k]) return items[i];
+            }
+        }
+        // 退一步：前缀包含（Hy4 / Hy4 preview 这类同名族），优先已选中的那个
+        if (want) {
+            var fuzzy = [];
+            for (var j = 0; j < items.length; j++) {
+                var nm = itemName(items[j]);
+                if (nm && (nm.indexOf(want) === 0 || want.indexOf(nm) === 0)) fuzzy.push(items[j]);
+            }
+            if (fuzzy.length === 1) return fuzzy[0];
+            for (var q = 0; q < fuzzy.length; q++) {
+                if (fuzzy[q].getAttribute('aria-selected') === 'true') return fuzzy[q];
+            }
+            if (fuzzy.length) return fuzzy[0];
+        }
+        return null;
+    }
+
+    function clickNode(el) {
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (type) {
+            el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+        });
+    }
+
+    function waitForList(timeoutMs) {
+        var deadline = Date.now() + (timeoutMs || 1500);
+        return new Promise(function (resolve) {
+            (function poll() {
+                if (document.querySelector(MENU_LIST)) return resolve(true);
+                if (Date.now() > deadline) return resolve(false);
+                setTimeout(poll, 50);
+            })();
+        });
+    }
+
+    /** 当前官方档位的显示名（我们的覆盖标签之前调用） */
+    function officialLabel() {
+        var l = document.querySelector('.cr-model-selector__trigger-label');
+        return l ? String(l.textContent || '').trim() : '';
+    }
+
+    function idByLabel(label) {
+        if (!label) return '';
+        for (var i = 0; i < modelList.length; i++) if (modelList[i].name === label) return modelList[i].id;
+        for (var j = 0; j < modelList.length; j++) if (modelList[j].id === label) return modelList[j].id;
+        return '';
+    }
+
+    /** 官方档位的 aria-label："Select model: Hy4" —— React 自己写的，可以用来验证真的切过去了 */
+    function officialAria() {
+        var t = document.querySelector('.cr-model-selector__trigger');
+        return t ? String(t.getAttribute('aria-label') || '') : '';
+    }
+
+    function waitApplied(name, ms) {
+        var deadline = Date.now() + (ms || 900);
+        return new Promise(function (resolve) {
+            (function poll() {
+                var a = officialAria();
+                if (a && name && a.indexOf(name) > -1) return resolve(true);
+                if (Date.now() > deadline) return resolve(false);
+                setTimeout(poll, 60);
+            })();
+        });
+    }
+
     function applyMainModel(modelId) {
-        var sid = currentSessionId();
-        var attempts = [];
-        if (probe.setModelFn) {
-            attempts.push({
-                name: 'workbuddyDesktop.setSessionModel',
-                run: function () { return probe.setModelFn(sid, modelId); },
-            });
+        if (!modelId) {
+            lastApply = '未设置主模型';
+            return Promise.resolve({ ok: false, detail: lastApply });
         }
-        if (probe.invoke) {
-            // 有 sessionId 才带上，避免把 null 当成"指定会话=null"传下去
-            if (sid) {
-                attempts.push({
-                    name: '__wbInvoke(session:setModel)',
-                    run: function () {
-                        return window.__wbInvoke('session:setModel', { sessionId: sid, modelId: modelId });
-                    },
-                });
+        var trig = document.querySelector('.cr-model-selector__trigger');
+        if (!trig) {
+            lastApply = '当前页面没有模型选择器';
+            return Promise.resolve({ ok: false, detail: lastApply });
+        }
+        if (!document.querySelector(MENU_LIST)) trig.click(); // 没展开就先展开
+        return waitForList(1800).then(function (ready) {
+            if (!ready) {
+                lastApply = '模型下拉没有展开，无法切换';
+                return { ok: false, detail: lastApply };
             }
-            attempts.push({
-                name: '__wbInvoke(session:setModel) 无 sessionId',
-                run: function () {
-                    return window.__wbInvoke('session:setModel', { modelId: modelId });
-                },
-            });
-        }
-
-        function step(i) {
-            if (i >= attempts.length) {
-                lastApply = '全部方式失败：宿主未暴露模型切换接口';
-                return Promise.resolve({ ok: false, detail: lastApply });
+            var item = findMenuItem(modelId);
+            if (!item) {
+                if (document.querySelector(MENU_LIST)) closeModelPopover();
+                lastApply = '下拉里找不到「' + shortName(modelId) + '」';
+                return { ok: false, detail: lastApply };
             }
-            var a = attempts[i];
-            return Promise.resolve()
-                .then(a.run)
-                .then(function (r) {
-                    if (r && r.error) throw new Error(String(r.error));
-                    // 这个通道只回 {success:true}，不回模型 id，所以只能算"已请求"
-                    var echoed = r && (r.modelId || r.model);
-                    lastApply = echoed
-                        ? '成功：' + a.name + ' → ' + echoed
-                        : '已请求切换（' + a.name + '，通道无回执，以界面显示为准）';
-                    return { ok: true, detail: lastApply };
-                })
-                .catch(function (e) {
-                    return step(i + 1).catch(function () { return { ok: false, detail: String(e && e.message || e) }; });
-                });
-        }
+            var name = shortName(modelId);
+            syncingMain = true;
+            clickNode(item);
+            setTimeout(function () { syncingMain = false; }, 150);
 
-        return step(0).then(function (r) {
-            ctx.log('切换主模型', modelId, r.detail);
-            return r;
+            // 用官方 aria-label 复核：真的变了才算成功，不再"假成功"
+            return waitApplied(name, 1200).then(function (applied) {
+                if (!applied) {
+                    lastApply = '点了「' + name + '」但官方档位没变（当前：' + officialAria().replace(/^Select model:\s*/, '') + '）';
+                    return { ok: false, detail: lastApply };
+                }
+                lastApply = '已切到官方档位「' + name + '」';
+                ctx.log('切换主模型', modelId, lastApply);
+                return { ok: true, detail: lastApply };
+            });
         });
     }
 
@@ -588,6 +1030,35 @@ function activate(ctx) {
         } catch (e) {
             ctx.log('订阅产品配置失败（不影响手动刷新）', e);
         }
+    }
+
+    /* ---------- 真实阶段：hook 在子代理调用前后写 phase.json ---------- */
+
+    var phaseTimer = null;
+
+    function pollPhase() {
+        var meta = window.__wbpro && window.__wbpro.meta;
+        if (!meta || !meta.controlUrl || !state.duo) return;
+        fetch(meta.controlUrl + '/api/duo/state?t=' + meta.controlToken)
+            .then(function (r) { return r.json(); })
+            .then(function (snap) {
+                if (!state.duo || !snap) return;
+                var p = snap.phase && snap.phase.phase;
+                var at = (snap.phase && snap.phase.at) || 0;
+                var fresh = Date.now() - at < 10 * 60 * 1000;
+                var want = p === 'working' && fresh ? 'working' : 'planning';
+                if (state.phase !== want) setPhase(want);
+            })
+            .catch(function () { /* 控制服务不在就维持现状 */ });
+    }
+
+    function startPhasePoll() {
+        if (phaseTimer) return;
+        phaseTimer = setInterval(pollPhase, 1500);
+        ctx.onCleanup(function () {
+            if (phaseTimer) { clearInterval(phaseTimer); phaseTimer = null; }
+        });
+        pollPhase();
     }
 
     function subscribeEvents() {
@@ -714,17 +1185,35 @@ function activate(ctx) {
         srcRow.appendChild(refresh);
         body.appendChild(srcRow);
 
+        // 主从模式开关（与模型下拉里的「主从模型」是同一个状态）
+        var duoRow = document.createElement('div');
+        duoRow.style.cssText =
+            'display:flex;align-items:center;gap:8px;margin:0 0 10px;padding:7px 9px;' +
+            'border-radius:8px;background:rgba(83,74,183,.16);border:1px solid rgba(127,119,221,.35);font-size:12px;';
+        var duoTxt = document.createElement('span');
+        duoTxt.style.flex = '1';
+        duoTxt.textContent = state.duo ? '主从协作：已开启（对话流里会显示当前阶段）' : '主从协作：未开启';
+        var duoBtn = document.createElement('button');
+        duoBtn.textContent = state.duo ? '关闭' : '开启';
+        duoBtn.style.cssText =
+            'padding:4px 10px;border-radius:6px;border:1px solid rgba(255,255,255,.2);' +
+            'background:transparent;color:inherit;cursor:pointer;font-size:11px;';
+        duoBtn.onclick = function () { setDuo(!state.duo); };
+        duoRow.appendChild(duoTxt);
+        duoRow.appendChild(duoBtn);
+        body.appendChild(duoRow);
+
         var mainSel = document.createElement('select');
         mainSel.innerHTML = selectHtml(state.mainModel);
         mainSel.style.cssText = 'flex:1;padding:4px 6px;border-radius:6px;background:rgba(255,255,255,.06);color:inherit;border:1px solid rgba(255,255,255,.14);';
         row('主模型').appendChild(mainSel);
-        note('决策与验收；切换后立即作用于当前会话');
+        note('决策与验收；开启「主从模型」时充当当前会话模型');
 
         var workerSel = document.createElement('select');
         workerSel.innerHTML = selectHtml(state.workerModel);
         workerSel.style.cssText = mainSel.style.cssText;
         row('工作模型').appendChild(workerSel);
-        note('执行计划；写入配置后需重启 WorkBuddy 生效');
+        note('执行计划；由 hook 在每次子代理调用时指定，改完下一次委派即生效');
 
         var turns = document.createElement('input');
         turns.type = 'number';
@@ -751,17 +1240,20 @@ function activate(ctx) {
             saveConfig(patch)
                 .then(function (res) {
                     // 配置已经落地（本地或 runtime.json），接着尝试切换当前会话模型
-                    var switchP = patch.mainModel
-                        ? applyMainModel(patch.mainModel).catch(function (e) {
-                              return { ok: false, detail: String((e && e.message) || e) };
-                          })
-                        : Promise.resolve(null);
+                    var switchP =
+                        patch.mainModel && state.duo
+                            ? applyMainModel(patch.mainModel).catch(function (e) {
+                                  return { ok: false, detail: String((e && e.message) || e) };
+                              })
+                            : Promise.resolve(null);
                     return switchP.then(function (r) {
                         lastApply = r ? r.detail : '';
                         if (!res.synced) {
                             ctx.ui.toast('已保存到本地；控制服务未启动，运行 wbpro up 后会自动补写');
+                        } else if (patch.mainModel && !state.duo) {
+                            ctx.ui.toast('主模型已保存；选中「主从模型」档位时生效');
                         } else if (patch.workerModel) {
-                            ctx.ui.toast('已保存；工作模型重启后生效');
+                            ctx.ui.toast('已保存；工作模型下一次子代理调用生效');
                         } else {
                             ctx.ui.toast('已保存');
                         }
@@ -887,12 +1379,18 @@ function activate(ctx) {
 
     /* ---------- 启动 ---------- */
 
-    detect();
-    mountBadge();
-    loadConfig();
-    subscribeEvents();
-    subscribeConfigChange();
-    refreshModels();
+    try {
+        detect();
+        mountBadge();
+        loadConfig();
+        subscribeEvents();
+        subscribeConfigChange();
+        refreshModels();
+        installDuoUI();
+        window.__duoBoot = 'ok';
+    } catch (e) {
+        window.__duoBoot = 'ERR: ' + String((e && e.stack) || e);
+    }
 
     var keeper = setInterval(function () {
         if (badge && !badge.isConnected && document.body) document.body.appendChild(badge);
@@ -906,6 +1404,16 @@ function activate(ctx) {
         if (unsubConfig && typeof unsubConfig === 'function') {
             try { unsubConfig(); } catch (e) { /* ignore */ }
         }
+        if (menuObserver) { menuObserver.disconnect(); menuObserver = null; }
+        if (menuTimer) { clearTimeout(menuTimer); menuTimer = null; }
+        if (chipTimer) { clearInterval(chipTimer); chipTimer = null; }
+        document.removeEventListener('click', onDocClickCapture, true);
+        document.documentElement.classList.remove('wbpro-duo-mode');
+        trigOrig = null;
+        var chipNode = document.querySelector('[' + CHIP_FLAG + ']');
+        if (chipNode) chipNode.remove();
+        var rowNode = document.querySelector('[' + MENU_FLAG + ']');
+        if (rowNode) rowNode.remove();
         if (!(panelRef && panelRef.persist)) panelRef && panelRef.remove();
         panelRef = null;
         badge && badge.remove();
