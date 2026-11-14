@@ -1,0 +1,13 @@
+{
+  "id": "dual-model",
+  "name": "双模型协同",
+  "version": "0.4.3",
+  "managed": true,
+  "description": "主模型负责决策与验收，工作模型负责执行；对话中实时显示当前阶段由哪个模型负责",
+  "renderer": "renderer.js",
+  "contributes": {
+    "panel": {
+      "position": "bottom-right"
+    }
+  }
+}

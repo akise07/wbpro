@@ -8,7 +8,7 @@
     var Z = 2147483000;
     // 每次改动运行时能力都要 +1：版本不同会替换掉页面里的旧 host，
     // 否则旧 host 会因为下面的 early-return 一直占着位置，新 API（如 control）永远不生效。
-    var RUNTIME_VERSION = '0.5.0';
+    var RUNTIME_VERSION = '0.6.0';
 
     var prev = window[KEY];
     if (prev && prev.alive && prev.runtimeVersion === RUNTIME_VERSION) return;
@@ -30,7 +30,7 @@
     var host = {
         alive: true,
         runtimeVersion: RUNTIME_VERSION,
-        version: '0.5.0',
+        version: '0.6.0',
         plugins: new Map(),
         mounted: [], // 面板宿主节点，用于重挂
         log: [],
@@ -237,6 +237,14 @@
         },
         reload: function () { return ctl('/api/reload', { method: 'POST', body: '{}' }); },
         openDir: function () { return ctl('/api/open-dir', { method: 'POST', body: '{}' }); },
+        // 插件运行时配置：写在插件目录的 runtime.json，Node 侧也读同一份
+        configGet: function (id) { return ctl('/api/config/' + encodeURIComponent(id)); },
+        configSet: function (id, config) {
+            return ctl('/api/config/' + encodeURIComponent(id), {
+                method: 'POST',
+                body: JSON.stringify(config || {}),
+            });
+        },
     };
 
     /* ---------------- 插件上下文 ---------------- */

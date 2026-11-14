@@ -169,6 +169,7 @@ function activate(ctx) {
 | `ctx.storage` | `get(k, dflt)` / `set(k, v)` | 按插件命名空间隔离 |
 | `ctx.backend` | `baseUrl` / `fetch(p, init)` / `json(p)` | 访问插件自己的后端进程 |
 | `ctx.control` | `list()` / `toggle(id, enabled)` / `reload()` / `openDir()` | 调用 wbpro 控制服务（插件管理器用的就是它） |
+| `ctx.control` | `configGet(id)` / `configSet(id, cfg)` | 读写插件目录下的 `runtime.json`，Node 侧也能读同一份 |
 | `ctx` | `app` | 宿主信息：应用版本、调试端口、注入时间 |
 | | `log(...)` | 带插件前缀的日志 |
 | | `onCleanup(fn)` | 注册卸载回调 |
@@ -212,6 +213,69 @@ POST /api/open-dir                  → 资源管理器打开插件目录
 
 注意：`persist` 面板不会被自动加进卸载队列，插件自己的 `cleanup` 里也不要 `remove()` 它，否则又会「关了打不开」。
 
+## 7.5 双模型协同（`dual-model`）
+
+主模型负责决策与验收，工作模型负责执行，界面上实时显示当前阶段由谁负责。
+
+**两个模型走的是两条完全不同的通道**，这是关键：
+
+| 角色 | 通道 | 生效时机 |
+|---|---|---|
+| 主模型 | `session:setModel`（当前会话模型） | 点保存后立即 |
+| 工作模型 | `CODEBUDDY_CODE_SUBAGENT_MODEL`（子代理模型） | 重启 WorkBuddy |
+
+工作模型为什么必须重启？因为子代理的模型由 CLI 启动时读取环境变量决定（`resolveAgentModel` 里 `process.env.CODEBUDDY_CODE_SUBAGENT_MODEL` 优先），而渲染层改不了已经跑起来的 CLI 进程。
+
+**使用流程**
+
+1. 点右下角浮标 → 面板
+2. 选主模型、工作模型、执行轮次 → 保存
+3. 首次设置工作模型后，重启一次（`wbpro up --restart --yes`）
+4. 点「复制协同规则」，粘到项目 `CODEBUDDY.md` 末尾
+5. 之后每次对话，浮标会显示「主 xxx · 决策」或「工 xxx · 执行中」
+
+**模型列表从哪来（与官方选择器同源，不是自己筛的）**：官方渲染层是 `normalizeProductModels()` → `selectTeamsModelsByCliAgent()`，规则是
+
+1. 候选池 = 产品配置的 `models`；
+2. 若配置里有非空 `availableModels` → 只保留其中的 id（`custom-local:` 前缀会先剥掉再比对）；
+3. 若 `agents[]` 里 `name === "cli"` 且带 `models` 数组 → **以它为白名单和顺序**。这就是官方下拉框里「快速 / 均衡 / 极致 / Hy3 …」那十几个的来源，当前配置是 19 个；
+4. 再并上用户自己的自定义模型（`custom-local:*` / `tags` 含 `custom`），官方在策略允许时同样会列出它们；
+5. `modelPromotions` / `modelTiers` 提供倍率角标（限时免费、夜间折扣、订阅优先）。
+
+插件完全照这五步实现，所以下拉框顺序、倍率、角标与官方一致；面板顶部显示「模型来源：运行时 · 官方列表 25 / 66 个」（25 = 19 官方 + 6 自定义，66 = 配置里的模型总数）。
+
+取不到宿主配置时退回内置表，内置表也换成了同一份 19 个的官方白名单，不再是早期那份手工整理、已经过时的 43 个。
+
+取数入口有个坑（实测 5.9.3）：`workbuddyDesktop` 上**没有** `config.getProductConfiguration`，`workbuddyDesktop.invoke(...)` 也不认这个命令（会报 `Unsupported desktop command`）。唯一可用的是泛化桥：
+
+```js
+await window.__wbInvoke('config:getProductConfiguration')   // → { models: 66, agents: 20, modelPromotions, modelTiers, ... }
+```
+
+插件优先用这条通道；万一某个版本把它挂成了对象方法，也会退回去试 `findFns` 找到的候选，所以两种形态都能取到。
+
+上游链路是 `GET /v3/config`
+
+**保存为什么不会失败**：配置写两处——页面里的 `localStorage`（永远可写）和插件目录的 `runtime.json`（由控制服务写，Node 侧读它注入环境变量）。控制服务没起来时（没跑 `wbpro up`），保存照样成功，只是提示「已保存到本地」，并记一个 pending 标记；下次 `up` 起来后自动补写。所以不会再出现 `保存失败: Failed to fetch`。
+
+**这两个前提必须满足**，否则功能会降级：
+
+| 能力 | 依赖 | 没有时会怎样 |
+|---|---|---|
+| 写 `runtime.json`（工作模型环境变量） | `wbpro up` 在跑 | 只存本地，补齐后自动同步 |
+| 热更新（改文件后自动重注入） | `wbpro up` 在跑 | 需要手动 `wbpro inject` 或重启 |
+| 主模型切换 | `__wbInvoke('session:setModel', ...)` | 通道只回 `{success:true}`、不回模型 id，因此面板显示「已请求切换，以界面为准」 |
+
+**配置存放**：`~/.workbuddy/plugins_pro/dual-model/runtime.json`。页面侧通过控制服务的 `/api/config/dual-model` 读写，`wbpro` 启动时读同一份文件注入环境变量。
+
+**自检区**：面板底部的四项（宿主对象 / `__wbInvoke` / `__wbOn` / `setSessionModel`）是运行时探测结果。如果 `setSessionModel` 是 ✕，说明这个版本的宿主没暴露该接口，主模型只能靠 `settings.json` 改——其余功能不受影响。
+
+**已知边界**
+
+- 阶段自动判断是「启发式」的：订阅 `session:event` 后找 `toolName`/`title`/`kind` 里是否带 agent/task。官方没公开事件结构，所以有可能判断不出来；面板里可以手动标记阶段兜底。
+- 协作靠提示词协议，不是硬约束。想强制，得配合 hook 的 `permissionDecision`。
+- 「主模型决策、工作模型执行」的实际效果取决于主模型愿不愿意委派。规则写得越具体，越稳定。
+
 ## 8. 为什么升级后还能用
 
 | 依赖 | 升级后是否稳定 |
@@ -232,7 +296,7 @@ POST /api/open-dir                  → 资源管理器打开插件目录
 5. **CSP 与 `new Function`**：注入的 bundle 不用 eval，插件源码是直接内联成函数体的，绕开 CSP 限制。插件里也不要自己用 `eval`。
 6. **后端插件推荐 `.cjs`**：`wbpro/package.json` 有 `"type": "module"`，同目录下的 `.js` 会被当 ESM 解析，`require` 会报错。
 7. **侧边栏入口靠文本定位**：`plugin-manager/renderer.js` 里 `ANCHOR_TEXTS = ['更多', 'More']`，官方如果改了导航文案，改这一行即可；万一整块结构大改，`findRow()` 会退回两层祖先，仍能插进去，只是位置可能偏。
-8. **改了 `runtime/bootstrap.js` 必须 +`RUNTIME_VERSION`**。页面里的 host 会一直活着，同版本号会走 early-return 复用旧对象，新加的 API（比如 `ctx.control`）不会生效，表现为「渲染失败: Cannot read properties of undefined」。当前版本 `0.5.0`。重启 wbpro 后会自动替换旧 host，不需要刷新页面。
+8. **改了 `runtime/bootstrap.js` 必须 +`RUNTIME_VERSION`**。页面里的 host 会一直活着，同版本号会走 early-return 复用旧对象，新加的 API（比如 `ctx.control`）不会生效，表现为「渲染失败: Cannot read properties of undefined」。当前版本 `0.6.0`。重启 wbpro 后会自动替换旧 host，不需要刷新页面。
 9. **升级运行时版本的那一次，面板会闪一下**。因为版本不同会走「整体替换旧 host」的路径，旧面板被销毁。这只是一次性的迁移代价；之后就进入差分模式，不再重建。想彻底避开，就让 `RUNTIME_VERSION` 保持不变、只改插件代码。
 9. **`--restart` 会杀掉自己**。跑在 WorkBuddy 自带终端里时，wbpro 是应用进程的后代，`taskkill /T /F` 会连它一起杀，重启后没人注入。所以这种情况会自动切后台接管（`cmd /c start` 制造孤儿进程，脱离进程树），日志在 `wbpro.log`。另外后台进程必须清掉 `NODE_OPTIONS` 和 `ELECTRON_RUN_AS_NODE`，否则会加载宿主 shim 或进入 Node 模式。
 

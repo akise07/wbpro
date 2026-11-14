@@ -8,7 +8,7 @@ import process from 'node:process';
 import { spawn } from 'node:child_process';
 import { listTargets, waitForCdp, waitForDomReady, waitForMainTarget } from '../lib/cdp.mjs';
 import { DEFAULT_PLUGINS_DIR, loadPlugins, setPluginEnabled, watchPlugins } from '../lib/registry.mjs';
-import { appVersion, electronVersion, exePath, killAll, launch, loadConfig, processCount } from '../lib/launcher.mjs';
+import { appVersion, electronVersion, exePath, killAll, launch, loadConfig, loadPluginEnv, processCount } from '../lib/launcher.mjs';
 import { Injector, attach, loadAndInject } from '../lib/injector.mjs';
 import { startControl } from '../lib/control.mjs';
 
@@ -344,7 +344,8 @@ async function cmdUp() {
 
     // 启动最多试两轮：第一轮被单实例锁顶掉时，再等一会儿重来
     for (let attempt = 1; attempt <= 2; attempt++) {
-        const pid = launch(cfg.appRoot, port);
+        const pluginEnv = loadPluginEnv(cfg.pluginsDir);
+    const pid = launch(cfg.appRoot, port, pluginEnv);
         console.log(`  ${ok('已启动')} WorkBuddy ${dim('v' + appVersion(cfg.appRoot))} pid=${pid} 调试端口=${port}`);
         console.log(dim('  等待调试端口就绪…'));
         try {
@@ -377,6 +378,14 @@ async function cmdDemo() {
         if (!fs.statSync(from).isDirectory()) continue;
         const to = path.join(cfg.pluginsDir, name);
 
+        const readVer = (dir) => {
+            try {
+                return JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf8')).version || '0.0.0';
+            } catch {
+                return null;
+            }
+        };
+
         let syncAlways = false;
         try {
             const m = JSON.parse(fs.readFileSync(path.join(from, 'plugin.json'), 'utf8'));
@@ -386,13 +395,20 @@ async function cmdDemo() {
             /* 读不到就当普通插件 */
         }
 
-        if (ifMissing && fs.existsSync(to) && !syncAlways) {
-            console.log(`  ${dim('跳过')} ${name}（已存在）`);
+        // 版本不同也强制同步：只靠 managed 标记容易漏（新插件忘了标就一直不更新），
+        // 版本号是唯一可靠信号。
+        const srcVer = readVer(from);
+        const dstVer = fs.existsSync(to) ? readVer(to) : null;
+        const outdated = srcVer && srcVer !== dstVer;
+
+        if (ifMissing && fs.existsSync(to) && !syncAlways && !outdated) {
+            console.log(`  ${dim('跳过')} ${name}（已存在 v${dstVer || '?'}）`);
             skipped++;
             continue;
         }
         fs.cpSync(from, to, { recursive: true });
-        console.log(`  ${ok('复制')} ${name} -> ${to}`);
+        const why = dstVer === null ? '' : outdated ? `  ${dim(`${dstVer} → ${srcVer}`)}` : '';
+        console.log(`  ${ok('复制')} ${name}${why}`);
         copied++;
     }
     if (skipped) console.log(dim(`\n  ${copied} 个已同步，${skipped} 个已存在跳过（--if-missing）`));
