@@ -1,0 +1,11 @@
+{
+  "id": "dusk-theme",
+  "name": "暮色主题",
+  "version": "0.1.0",
+  "description": "纯 CSS 注入示例：滚动条、选区、菜单强调色",
+  "renderer": "renderer.js",
+  "permissions": ["ui.css"],
+  "contributes": {
+    "panel": { "position": "bottom-right" }
+  }
+}

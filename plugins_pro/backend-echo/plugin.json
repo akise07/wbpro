@@ -1,0 +1,12 @@
+{
+  "id": "backend-echo",
+  "name": "后端示例",
+  "version": "0.1.0",
+  "description": "演示插件自带 Node 后端进程，通过本地 HTTP 与页面通信",
+  "renderer": "renderer.js",
+  "backend": { "entry": "backend.cjs" },
+  "permissions": ["ui.panel", "backend.local"],
+  "contributes": {
+    "panel": { "position": "bottom-left" }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "wbpro",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "WorkBuddy 运行时插件读取管理器（不改官方文件，官方更新后继续可用）",
+  "bin": { "wbpro": "./bin/wbpro.mjs" },
+  "engines": { "node": ">=20.10" },
+  "scripts": {
+    "up": "node bin/wbpro.mjs up",
+    "list": "node bin/wbpro.mjs list",
+    "doctor": "node bin/wbpro.mjs doctor"
+  }
+}
