@@ -53,7 +53,25 @@ node bin/wbpro.mjs list       # 列出插件目录
 已经开着 WorkBuddy 时：
 
 ```bash
-node bin/wbpro.mjs up --restart --yes    # 会关掉当前窗口重开，会话不丢但窗口会重启
+node bin/wbpro.mjs up --restart --yes    # 关掉当前窗口重开，会话不丢但窗口会重启
+```
+
+`--restart` 的行为（重点）：
+
+| 情况 | 实际动作 |
+|---|---|
+| 调试端口已开 | 不折腾进程，直接注入 |
+| 在**普通终端**里执行 | 结束进程 → 等它们真的退干净 → 启动 → 等主窗口和 DOM 就绪 → 注入 → 常驻 |
+| 在 **WorkBuddy 自带终端**里执行 | 自动把整套流程交给独立后台进程（`cmd /c start` 方式脱离进程树），本窗口可关闭，日志写 `wbpro/` 下的 `wbpro.log` |
+
+为什么要交接：`taskkill /T` 会顺父进程链一起杀，而 wbpro 跑在应用终端里时就在那棵树上，不交接的话「重启完就没人注入了」，表现就是你觉得 `--restart` 没有 `up` 的功能。
+
+相关开关：
+
+```bash
+node bin/wbpro.mjs up --restart --yes --dry-run   # 只打印将要执行的后台命令，不动进程
+node bin/wbpro.mjs up --restart --yes --detach    # 强制走后台接管
+node bin/wbpro.mjs logs                           # 查看后台日志尾部
 ```
 
 **把桌面快捷方式指向 `wbpro up`** 之后，日常就等于「带插件的 WorkBuddy」。用原快捷方式启动则是一个纯净的官方实例。
@@ -71,6 +89,7 @@ wbpro/
 │  └─ injector.mjs          注入 + 后端进程托管
 ├─ runtime/bootstrap.js     注入到页面的插件宿主（UI/存储/IPC API）
 └─ plugins_pro/             示例插件（运行时会复制到用户目录）
+   ├─ plugin-manager/       内置：左侧栏「插件管理」入口 + 列表/启停/热更新
    ├─ hello-panel/          浮动面板 + 宿主信息
    ├─ dusk-theme/           纯 CSS 主题
    └─ backend-echo/         自带 Node 后端进程
@@ -145,11 +164,39 @@ function activate(ctx) {
 | | `on(channel, cb)` | 订阅主进程推送 |
 | `ctx.storage` | `get(k, dflt)` / `set(k, v)` | 按插件命名空间隔离 |
 | `ctx.backend` | `baseUrl` / `fetch(p, init)` / `json(p)` | 访问插件自己的后端进程 |
+| `ctx.control` | `list()` / `toggle(id, enabled)` / `reload()` / `openDir()` | 调用 wbpro 控制服务（插件管理器用的就是它） |
 | `ctx` | `app` | 宿主信息：应用版本、调试端口、注入时间 |
 | | `log(...)` | 带插件前缀的日志 |
 | | `onCleanup(fn)` | 注册卸载回调 |
 
-## 7. 为什么升级后还能用
+## 7. 内置插件管理器
+
+`plugin-manager` 是系统插件（`"system": true`，不可被停用，否则会失去重新启用的入口）。它做两件事：
+
+**1）在左侧栏注入入口**
+
+不硬编码类名，而是找到文字为「更多」（或 `More`）的叶子节点 → 向上找到那一行 → **克隆整行** → 把图标换成拼图、文字换成「插件管理」、去掉 active 状态 → 插在原行后面。因为克隆的是官方节点，样式、间距、hover 效果全部自动继承，官方改主题也不用跟着改。
+
+React 重渲染会把节点冲掉，所以每 1.2s 检查一次 `isConnected`，掉了就补回去。
+
+**2）管理面板**
+
+点入口后弹出面板，显示：插件名 / 版本 / id / 标签（UI、后端）/ 描述 + 启用开关；底部有「热更新」和「打开插件目录」。面板开着时每 4s 拉一次列表，外部改动也能看到。
+
+开关走的是 wbpro 的控制服务，不是直接改内存：
+
+```
+GET  /api/plugins                   → { plugins: [...], dir }
+POST /api/plugins/:id/enabled       → 写回该插件 plugin.json 的 enabled，然后热重载
+POST /api/reload                    → 全量重新注入
+POST /api/open-dir                  → 资源管理器打开插件目录
+```
+
+控制服务只绑 `127.0.0.1`，每次启动生成随机 token，注入页面时带上 `?t=<token>`，同机其他进程拿到端口也调不动。
+
+**为什么开关能立刻生效**：`enabled:false` 的插件在扫描阶段就被跳过（源码都不会被读进 bundle），改完文件后 CLI 重新构建 bundle 并 `Runtime.evaluate` 注入，新 bundle 会先 `__reset()` 卸载旧插件再挂载新的。整个过程不重启应用。
+
+## 8. 为什么升级后还能用
 
 | 依赖 | 升级后是否稳定 |
 |---|---|
@@ -160,7 +207,7 @@ function activate(ctx) {
 
 万一哪天官方把这个开关关了，本方案失效但不破坏任何东西；降级路线是「版本感知的 asar 补丁器」（检测到版本变化才重打），需要另做。
 
-## 8. 已知坑（踩过）
+## 9. 已知坑（踩过）
 
 1. **`ELECTRON_RUN_AS_NODE=1` 必须清掉**。在 WorkBuddy 的 Agent 终端里它被继承，直接跑 `WorkBuddy.exe --xxx` 会变成纯 Node 进程，报 `bad option`。启动器的 `cleanEnv()` 已处理。
 2. **单实例锁 + `--user-data-dir` 无效**。主进程启动早期就 `app.setPath('userData', ...)` 覆盖了命令行，所以没法用独立 profile 开第二个实例做实验。
@@ -168,8 +215,11 @@ function activate(ctx) {
 4. **调试端口是明文可连的**。CDP 开在 `127.0.0.1`，任何本机进程都能连上并执行代码。只在需要时 `up`，不要长期挂着；也不要把端口映射到外网。
 5. **CSP 与 `new Function`**：注入的 bundle 不用 eval，插件源码是直接内联成函数体的，绕开 CSP 限制。插件里也不要自己用 `eval`。
 6. **后端插件推荐 `.cjs`**：`wbpro/package.json` 有 `"type": "module"`，同目录下的 `.js` 会被当 ESM 解析，`require` 会报错。
+7. **侧边栏入口靠文本定位**：`plugin-manager/renderer.js` 里 `ANCHOR_TEXTS = ['更多', 'More']`，官方如果改了导航文案，改这一行即可；万一整块结构大改，`findRow()` 会退回两层祖先，仍能插进去，只是位置可能偏。
+8. **改了 `runtime/bootstrap.js` 必须 +`RUNTIME_VERSION`**。页面里的 host 会一直活着，同版本号会走 early-return 复用旧对象，新加的 API（比如 `ctx.control`）不会生效，表现为「渲染失败: Cannot read properties of undefined」。当前版本 `0.2.0`。重启 wbpro 后会自动替换旧 host，不需要刷新页面。
+9. **`--restart` 会杀掉自己**。跑在 WorkBuddy 自带终端里时，wbpro 是应用进程的后代，`taskkill /T /F` 会连它一起杀，重启后没人注入。所以这种情况会自动切后台接管（`cmd /c start` 制造孤儿进程，脱离进程树），日志在 `wbpro.log`。另外后台进程必须清掉 `NODE_OPTIONS` 和 `ELECTRON_RUN_AS_NODE`，否则会加载宿主 shim 或进入 Node 模式。
 
-## 9. 能力边界
+## 10. 能力边界
 
 - ✅ 改界面：加面板、改样式、往现有节点挂东西、监听 DOM 变化
 - ✅ 加功能：任意 DOM 交互 + 调官方 IPC + 自己的 Node 后端（文件、数据库、网络都行）

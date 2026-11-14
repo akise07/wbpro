@@ -2,12 +2,15 @@
 // wbpro —— WorkBuddy 运行时插件读取管理器
 // 用法： wbpro up | status | list | doctor | inject
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { listTargets, waitForCdp, pickMainTarget } from '../lib/cdp.mjs';
-import { DEFAULT_PLUGINS_DIR, loadPlugins, watchPlugins } from '../lib/registry.mjs';
+import { spawn } from 'node:child_process';
+import { listTargets, waitForCdp, waitForDomReady, waitForMainTarget } from '../lib/cdp.mjs';
+import { DEFAULT_PLUGINS_DIR, loadPlugins, setPluginEnabled, watchPlugins } from '../lib/registry.mjs';
 import { appVersion, electronVersion, exePath, killAll, launch, loadConfig, processCount } from '../lib/launcher.mjs';
 import { Injector, attach, loadAndInject } from '../lib/injector.mjs';
+import { startControl } from '../lib/control.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] || 'up';
@@ -16,6 +19,7 @@ const getOpt = (name, dflt) => {
     const i = argv.indexOf(name);
     return i > -1 && argv[i + 1] ? argv[i + 1] : dflt;
 };
+const LOG_FILE = path.join(process.cwd(), 'wbpro.log');
 
 const color = (n) => (s) => (process.stdout.isTTY ? `\x1b[${n}m${s}\x1b[0m` : s);
 const dim = color(90);
@@ -34,6 +38,89 @@ async function cdpAlive(port) {
         return Array.isArray(list) && list.length > 0;
     } catch {
         return false;
+    }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function waitUntil(fn, timeoutMs, intervalMs = 400) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (await fn()) return true;
+        await sleep(intervalMs);
+    }
+    return false;
+}
+
+/** 是否跑在 WorkBuddy 自己的终端里（此时它属于应用进程树，会被 --restart 一起杀掉） */
+function insideAppTree() {
+    return !!(process.env.CODEBUDDY_SESSION_ID || process.env.WORKBUDDY_STARTUP_PID || process.env.WORKBUDDY_RESOURCES_PATH);
+}
+
+/**
+ * 把「重启 + 注入 + 常驻」整件事交给一个独立后台进程，自己退出。
+ *
+ * 关键点：不能直接 spawn —— 那样它仍是本进程的子进程，会被 taskkill /T 一并杀掉。
+ * 改成写一个 .cmd 再用 `cmd /c start` 拉起：发起它的 cmd 立即退出，
+ * 新进程变成孤儿（父 PID 已不存在），taskkill 的进程树遍历就抓不到它了。
+ */
+function handoffDetached({ dry = false } = {}) {
+    const args = ['up', '--restart', '--yes', '--phase2'];
+    const port = getOpt('--port', null);
+    if (port) args.push('--port', String(port));
+
+    if (process.platform !== 'win32') {
+        if (dry) return { dry: true, lines: [`${process.execPath} ${process.argv[1]} ${args.join(' ')}`] };
+        const out = fs.openSync(LOG_FILE, 'a');
+        const childEnv = { ...process.env };
+        delete childEnv.NODE_OPTIONS;
+        delete childEnv.ELECTRON_RUN_AS_NODE;
+        const child = spawn(process.execPath, [process.argv[1], ...args], {
+            cwd: process.cwd(),
+            env: childEnv,
+            detached: true,
+            stdio: ['ignore', out, out],
+        });
+        child.unref();
+        return { pid: child.pid };
+    }
+
+    const bat = path.join(os.tmpdir(), 'wbpro-restart.cmd');
+    const lines = [
+        '@echo off',
+        // 清掉宿主注入的变量，否则后台 node 会加载 app 的 shim / 进 Node 模式
+        'set NODE_OPTIONS=',
+        'set ELECTRON_RUN_AS_NODE=',
+        `cd /d "${process.cwd()}"`,
+        `echo.>>"${LOG_FILE}"`,
+        `echo ===== ${new Date().toISOString()} 后台接管重启 >>"${LOG_FILE}"`,
+        `"${process.execPath}" "${process.argv[1]}" ${args.join(' ')} >>"${LOG_FILE}" 2>&1`,
+    ];
+
+    if (dry) return { dry: true, lines, bat };
+
+    fs.writeFileSync(bat, lines.join('\r\n') + '\r\n', 'utf8');
+    const child = spawn('cmd.exe', ['/c', 'start', '', '/b', bat], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+    });
+    child.unref();
+    return { pid: child.pid };
+}
+
+function cmdLogs() {
+    banner();
+    const tail = tailLog(40);
+    console.log(tail ? tail : dim('  暂无日志（只有 --restart 后台接管时才写）'));
+}
+
+function tailLog(lines = 25) {
+    try {
+        const all = fs.readFileSync(LOG_FILE, 'utf8').split('\n');
+        return all.slice(-lines).join('\n');
+    } catch {
+        return '';
     }
 }
 
@@ -138,10 +225,15 @@ async function interactive() {
     const connectLoop = async () => {
         for (;;) {
             try {
+                // 先等真正的主窗口，再等 DOM 可用，最后才注入——重启后尤其重要，
+                // 否则会注入到闪屏/空白页，表现为「重启路径没有插件」。
+                await waitForMainTarget(cfg.port, { timeoutMs: 90_000 });
                 const { client: c } = await attach(cfg.port);
                 client = c;
                 injector = new Injector(c);
-                await doInject('首次注入');
+                const ready = await waitForDomReady(c, { timeoutMs: 30_000 });
+                if (!ready) console.log(warn('  页面 DOM 迟迟未就绪，先注入一次并等待重试'));
+                await doInject(ready ? '首次注入' : '提前注入');
                 c.on('close', () => {
                     console.log(warn('\n  页面连接断开，等待重连…（应用重启后会自动重新注入）'));
                     setTimeout(connectLoop, 1200);
@@ -152,7 +244,8 @@ async function interactive() {
                 });
                 break;
             } catch (e) {
-                await new Promise((r) => setTimeout(r, 1500));
+                console.log(dim(`  等待主窗口… ${e.message}`));
+                await sleep(1500);
             }
         }
         if (!stopWatch) {
@@ -163,6 +256,30 @@ async function interactive() {
         }
     };
 
+    // 控制服务：给页面里的插件管理器提供列表/启停/热更新能力
+    const ctl = await startControl({
+        pluginsDir: cfg.pluginsDir,
+        getPlugins: async () => {
+            const { plugins } = await loadPlugins(cfg.pluginsDir, { includeDisabled: true });
+            return plugins.map((p) => ({
+                id: p.id,
+                name: p.name,
+                version: p.version,
+                description: p.description,
+                enabled: p.enabled,
+                system: p.system,
+                ui: typeof p.code === 'string',
+                backend: !!p.backendEntry,
+                dir: p.dir,
+            }));
+        },
+        setEnabled: (id, enabled) => setPluginEnabled(cfg.pluginsDir, id, enabled),
+        reload: () => doInject('管理面板触发热更新'),
+    });
+    meta.controlUrl = ctl.url;
+    meta.controlToken = ctl.token;
+    console.log(dim(`  控制服务 127.0.0.1:${ctl.port}`));
+
     await connectLoop();
     console.log(dim('\n  监听中：Ctrl+C 退出（不会关闭 WorkBuddy）\n'));
 
@@ -170,6 +287,7 @@ async function interactive() {
         stopWatch?.();
         backends?.stopAll();
         client?.close();
+        ctl.close().catch(() => {});
         process.exit(0);
     };
     process.on('SIGINT', shutdown);
@@ -180,51 +298,104 @@ async function cmdUp() {
     banner();
     const cfg = loadConfig();
     const port = Number(getOpt('--port', cfg.port));
+    const wantRestart = has('--restart');
+    const phase2 = has('--phase2');
 
+    // 已经开着调试端口：直接注入（--restart 也走这条路，不重复折腾进程）
     if (await cdpAlive(port)) {
-        console.log(ok(`  检测到已开启调试端口 ${port} 的实例，直接注入`));
+        if (wantRestart) console.log(dim('  调试端口已开启，无需重启，直接注入'));
+        else console.log(ok(`  检测到已开启调试端口 ${port} 的实例，直接注入`));
         return interactive();
     }
 
     const count = await processCount();
     if (count > 0) {
         console.log(warn(`  已有 ${count} 个 WorkBuddy 进程在运行，但没有开启调试端口。`));
-        if (!has('--restart')) {
-            console.log(`  需要重启才能注入：${bold('wbpro up --restart')}${has('--yes') ? '' : '（会关闭当前会话窗口）'}`);
+        if (!wantRestart) {
+            console.log(`  需要重启才能注入：${bold('wbpro up --restart --yes')}（会关闭当前窗口）`);
             return;
         }
         if (!has('--yes')) {
             console.log(bad('  重启会关闭当前 WorkBuddy 窗口，请加 --yes 确认。'));
             return;
         }
+
+        // 关键：在应用自己的终端里跑时，taskkill /T 会把本进程一起杀掉，
+        // 导致重启后没人继续注入。此时把整套流程交给独立后台进程。
+        if (!phase2 && (has('--detach') || insideAppTree())) {
+            const r = handoffDetached({ dry: has('--dry-run') });
+            if (r.dry) {
+                console.log(dim('  --dry-run：以下命令会被放到后台执行（不实际运行）'));
+                for (const l of r.lines) console.log(dim('    ' + l));
+                return;
+            }
+            console.log(`  ${ok('已交给后台进程')} pid=${r.pid}`);
+            console.log(dim(`  日志：${LOG_FILE}`));
+            console.log(dim('  本窗口可以关闭；后台会完成重启 → 注入 → 常驻。'));
+            return;
+        }
+
         console.log(dim('  正在结束现有进程…'));
         await killAll();
-        await new Promise((r) => setTimeout(r, 2500));
+        const gone = await waitUntil(async () => (await processCount()) === 0, 30_000);
+        if (!gone) console.log(warn('  仍有残留进程，继续尝试启动（可能被单实例锁顶掉）'));
+        else console.log(dim('  旧进程已全部退出'));
     }
 
-    const pid = launch(cfg.appRoot, port);
-    console.log(`  ${ok('已启动')} WorkBuddy ${dim('v' + appVersion(cfg.appRoot))} pid=${pid} 调试端口=${port}`);
-    console.log(dim('  等待调试端口就绪…'));
-    await waitForCdp(port, { timeoutMs: 90_000 });
-    console.log(ok('  端口就绪'));
+    // 启动最多试两轮：第一轮被单实例锁顶掉时，再等一会儿重来
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        const pid = launch(cfg.appRoot, port);
+        console.log(`  ${ok('已启动')} WorkBuddy ${dim('v' + appVersion(cfg.appRoot))} pid=${pid} 调试端口=${port}`);
+        console.log(dim('  等待调试端口就绪…'));
+        try {
+            await waitForCdp(port, { timeoutMs: 60_000 });
+            console.log(ok('  端口就绪'));
+            break;
+        } catch (e) {
+            if (attempt === 2) throw e;
+            console.log(warn(`  启动未就绪（${e.message}），3 秒后重试一次`));
+            await sleep(3000);
+        }
+    }
     return interactive();
 }
 
-/** 把仓库里自带的示例插件复制到用户插件目录 */
+/** 把仓库里自带的示例插件复制到用户插件目录。
+ *  默认覆盖；--if-missing 时跳过已存在的非系统插件（保护用户改动），
+ *  系统插件（plugin-manager）始终同步，避免管理器停留在旧版。 */
 async function cmdDemo() {
     banner();
     const cfg = loadConfig();
+    const ifMissing = has('--if-missing');
     const src = new URL('../plugins_pro/', import.meta.url);
     const srcDir = src.pathname.replace(/^\/([A-Za-z]:)/, '$1');
     fs.mkdirSync(cfg.pluginsDir, { recursive: true });
+    let copied = 0;
+    let skipped = 0;
     for (const name of fs.readdirSync(srcDir)) {
         const from = path.join(srcDir, name);
         if (!fs.statSync(from).isDirectory()) continue;
         const to = path.join(cfg.pluginsDir, name);
+
+        let isSystem = false;
+        try {
+            isSystem = JSON.parse(fs.readFileSync(path.join(from, 'plugin.json'), 'utf8')).system === true;
+        } catch {
+            /* 读不到就当普通插件 */
+        }
+
+        if (ifMissing && fs.existsSync(to) && !isSystem) {
+            console.log(`  ${dim('跳过')} ${name}（已存在）`);
+            skipped++;
+            continue;
+        }
         fs.cpSync(from, to, { recursive: true });
         console.log(`  ${ok('复制')} ${name} -> ${to}`);
+        copied++;
     }
-    console.log(dim(`\n  示例插件已就位，执行 wbpro up 启动并注入`));
+    if (skipped) console.log(dim(`\n  ${copied} 个已同步，${skipped} 个已存在跳过（--if-missing）`));
+    else console.log(dim(`\n  ${copied} 个插件已就位`));
+    console.log(dim(`  插件目录：${cfg.pluginsDir}`));
 }
 
 async function main() {
@@ -233,6 +404,8 @@ async function main() {
             return cmdUp();
         case 'demo':
             return cmdDemo();
+        case 'logs':
+            return cmdLogs();
         case 'list':
             return cmdList();
         case 'status':
@@ -245,18 +418,8 @@ async function main() {
                 console.log(bad(`  CDP 未开启，先执行 wbpro up`));
                 return;
             }
-            const { client } = await attach(cfg.port);
-            const injector = new Injector(client);
-            const { plugins } = await loadPlugins(cfg.pluginsDir);
-            const r = await loadAndInject({
-                injector,
-                plugins,
-                meta: { appVersion: appVersion(cfg.appRoot), port: cfg.port, startedAt: new Date().toISOString() },
-            });
-            console.log(ok(`  已注入 ${plugins.length} 个插件（${r.sizeKb} KB）`));
-            client.close();
-            r.backends.stopAll();
-            return;
+            console.log(ok(`  CDP 已就绪，注入并常驻`));
+            return interactive();
         }
         default:
             console.log(`未知命令: ${cmd}\n可用: up | status | list | doctor | inject`);

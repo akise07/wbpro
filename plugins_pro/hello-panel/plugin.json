@@ -4,8 +4,14 @@
   "version": "0.1.0",
   "description": "验证注入链路：可拖动浮动面板，读取宿主信息",
   "renderer": "renderer.js",
-  "permissions": ["ui.panel", "storage"],
+  "permissions": [
+    "ui.panel",
+    "storage"
+  ],
   "contributes": {
-    "panel": { "position": "top-right" }
-  }
+    "panel": {
+      "position": "top-right"
+    }
+  },
+  "enabled": true
 }

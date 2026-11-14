@@ -6,12 +6,31 @@
     'use strict';
     var KEY = '__wbpro';
     var Z = 2147483000;
+    // 每次改动运行时能力都要 +1：版本不同会替换掉页面里的旧 host，
+    // 否则旧 host 会因为下面的 early-return 一直占着位置，新 API（如 control）永远不生效。
+    var RUNTIME_VERSION = '0.2.0';
 
-    if (window[KEY] && window[KEY].alive) return;
+    var prev = window[KEY];
+    if (prev && prev.alive && prev.runtimeVersion === RUNTIME_VERSION) return;
+
+    // 旧版本运行时：先尽量卸载干净，再整体替换
+    if (prev && prev.alive) {
+        try {
+            prev.keeper && clearInterval(prev.keeper);
+            prev.__reset && prev.__reset();
+        } catch (e) {
+            /* 旧运行时状态可能不完整，忽略 */
+        }
+        document.querySelectorAll('[data-wbpro-panel],[data-wbpro-style],[data-wbpro-nav]').forEach(function (n) {
+            try { n.remove(); } catch (e) { /* ignore */ }
+        });
+        try { delete window[KEY]; } catch (e) { window[KEY] = undefined; }
+    }
 
     var host = {
         alive: true,
-        version: '0.1.0',
+        runtimeVersion: RUNTIME_VERSION,
+        version: '0.2.0',
         plugins: new Map(),
         mounted: [], // 面板宿主节点，用于重挂
         log: [],
@@ -142,6 +161,28 @@
         };
     }
 
+    /* ---------------- 控制服务 ---------------- */
+    function ctl(pathname, init) {
+        var meta = host.meta || {};
+        if (!meta.controlUrl) return Promise.reject(new Error('控制服务未启动（请用 wbpro up 启动）'));
+        var sep = pathname.indexOf('?') > -1 ? '&' : '?';
+        var url = meta.controlUrl + pathname + sep + 't=' + meta.controlToken;
+        var opts = Object.assign({ headers: { 'Content-Type': 'application/json' } }, init || {});
+        return fetch(url, opts).then(function (r) { return r.json(); });
+    }
+
+    host.control = {
+        list: function () { return ctl('/api/plugins'); },
+        toggle: function (id, enabled) {
+            return ctl('/api/plugins/' + encodeURIComponent(id) + '/enabled', {
+                method: 'POST',
+                body: JSON.stringify({ enabled: !!enabled }),
+            });
+        },
+        reload: function () { return ctl('/api/reload', { method: 'POST', body: '{}' }); },
+        openDir: function () { return ctl('/api/open-dir', { method: 'POST', body: '{}' }); },
+    };
+
     /* ---------------- 插件上下文 ---------------- */
     function makeContext(def) {
         var id = def.id;
@@ -251,6 +292,8 @@
 
             onCleanup: function (fn) { cleanups.push(fn); },
         };
+
+        ctx.control = host.control;
 
         ctx.cleanup = function () {
             while (cleanups.length) {
