@@ -53,7 +53,7 @@ node bin/wbpro.mjs list       # 列出插件目录
 
 **或者直接双击 `start.bat`**：自动定位 Node → 同步随包插件 → 带调试端口启动 → 注入 → 常驻（窗口开着别关）。
 
-`start.bat` 里的同步用的是 `demo --if-missing`：标记了 `system: true`（插件管理器）或 `managed: true`（随包示例）的插件**每次都会覆盖更新**，你自己建的插件目录不会被碰。
+`start.bat` 里的同步用的是 `demo --if-missing`：标记了 `system: true`（插件管理器）或 `managed: true`（随包示例）的插件**每次都会覆盖更新**，你自己建的插件目录不会被碰。覆盖时会**保留你在管理面板里的启用/停用选择**，不会因为重启又被悄悄打开。
 
 已经开着 WorkBuddy 时：
 
@@ -341,7 +341,9 @@ await window.__wbInvoke('config:getProductConfiguration')   // → { models: 66,
 7. **侧边栏入口靠文本定位**：`plugin-manager/renderer.js` 里 `ANCHOR_TEXTS = ['更多', 'More']`，官方如果改了导航文案，改这一行即可；万一整块结构大改，`findRow()` 会退回两层祖先，仍能插进去，只是位置可能偏。
 8. **改了 `runtime/bootstrap.js` 必须 +`RUNTIME_VERSION`**。页面里的 host 会一直活着，同版本号会走 early-return 复用旧对象，新加的 API（比如 `ctx.control`）不会生效，表现为「渲染失败: Cannot read properties of undefined」。当前版本 `0.6.0`。重启 wbpro 后会自动替换旧 host，不需要刷新页面。
 9. **升级运行时版本的那一次，面板会闪一下**。因为版本不同会走「整体替换旧 host」的路径，旧面板被销毁。这只是一次性的迁移代价；之后就进入差分模式，不再重建。想彻底避开，就让 `RUNTIME_VERSION` 保持不变、只改插件代码。
-9. **`--restart` 会杀掉自己**。跑在 WorkBuddy 自带终端里时，wbpro 是应用进程的后代，`taskkill /T /F` 会连它一起杀，重启后没人注入。所以这种情况会自动切后台接管（`cmd /c start` 制造孤儿进程，脱离进程树），日志在 `wbpro.log`。另外后台进程必须清掉 `NODE_OPTIONS` 和 `ELECTRON_RUN_AS_NODE`，否则会加载宿主 shim 或进入 Node 模式。
+10. **`--restart` 会杀掉自己**。跑在 WorkBuddy 自带终端里时，wbpro 是应用进程的后代，`taskkill /T /F` 会连它一起杀，重启后没人注入。所以这种情况会自动切后台接管（`cmd /c start` 制造孤儿进程，脱离进程树），日志在 `wbpro.log`。另外后台进程必须清掉 `NODE_OPTIONS` 和 `ELECTRON_RUN_AS_NODE`，否则会加载宿主 shim 或进入 Node 模式。
+11. **`demo --if-missing` 会覆盖系统/随包插件，但必须保留用户的启用状态**。`plugin-manager`（`system`）和示例（`managed`）每次启动都会覆盖更新，所以覆盖前要读一次目标 `plugin.json` 的 `enabled`，写回 `false` 后再复制，否则用户手动停用的插件每次启动都会被悄悄打开。
+12. **`installDuoHooks` 绝不能把解析失败当成空配置**。`settings.json` 里若有注释（JSONC）或语法错误，`JSON.parse` 会抛错；此时若退回 `{}` 再写回，用户的模型、主题、权限规则会全部丢失。正确做法是放弃本次写入并提示，同时用「临时文件 + rename」保证不写半截。
 
 ## 10. 能力边界
 

@@ -30,7 +30,9 @@
     var host = {
         alive: true,
         runtimeVersion: RUNTIME_VERSION,
-        version: '0.6.0',
+        // 单一来源：不要在这里再写一遍字面量，否则改了上面那行这里会漏改，
+        // 导致 status 显示的版本与 early-return 的判断口径不一致。
+        version: RUNTIME_VERSION,
         plugins: new Map(),
         mounted: [], // 面板宿主节点，用于重挂
         log: [],

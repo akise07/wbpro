@@ -1,0 +1,22 @@
+# 运行时产物
+wbpro.log
+*.log
+
+# 插件运行时状态（由 wbpro / hook 在用户目录生成，不应入库）
+plugins_pro/*/runtime.json
+plugins_pro/*/phase.json
+plugins_pro/*/hook.log
+
+# 依赖与系统
+node_modules/
+.DS_Store
+Thumbs.db
+
+# 逆向产物：1.2GB 二进制与解包快照，由 tools/ 脚本可复现，不入库
+# 复现方式见 wb_src/INDEX.md 第 5 节
+wb_src/
+
+# 本地记忆
+.workbuddy/
+
+tools/

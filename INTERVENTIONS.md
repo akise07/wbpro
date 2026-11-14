@@ -28,6 +28,20 @@
 
 开启方式：`WORKBUDDY_REMOTE_DEBUGGING_PORT`（源码里的隐藏开关，无生产限制）。
 
+### 1.1 换模型：IPC 是假的，只能点下拉（5.9.3 实测）
+
+| 方式 | 返回 | 实际效果 |
+|---|---|---|
+| `__wbInvoke('session:setModel', {sessionId, modelId})` | `{success:true}` | ✗ 下一条消息仍用旧模型 |
+| `workbuddyDesktop.setSessionModel(...)` | 对象/`unsupported` | ✗ 本版本没有该方法 |
+| 点 `.cr-model-selector__list` 里对应项 | React `onSelect` | ✅ 真实切换 |
+
+原因：官方切换完全发生在渲染层 —— 下拉项 onClick → 输入框 store `api.setModel(selection)` →
+`onChange` → 发送时 `ensureSessionModelBeforeSend` / `resolveAndSyncSessionModel` 才把模型同步进
+ACP 会话；`session:setModel` 只改了主进程里的会话记录，没有通知跑 Agent 的 ACP 连接。
+验证方式：点完看触发器 `aria-label` 是否变成 `Select model: <名称>`，以及会话 jsonl 里
+`"model"` 字段（`~/.workbuddy/projects/<cwd>/<session>.jsonl`）。
+
 ### 1.2 按「每次调用」换模型：Agent 工具的 model + PreToolUse（5.9.3 实测）
 
 官方唯一能"这一次调用用别的模型"的入口，是 `Agent`（子代理）工具的入参 `model`：
@@ -59,20 +73,6 @@ CLI 侧 `resolveAgentModel(t)` 解析顺序：**env `CODEBUDDY_CODE_SUBAGENT_MOD
 
 `dual-model` 插件就是靠这套做的：`UserPromptSubmit` 注入"执行必须委派"的规则，
 `PreToolUse(Agent)` 把 `model` 强改成工作模型，状态从 `runtime.json` 现读，改完下一次调用即生效。
-
-## 1.1 换模型：IPC 是假的，只能点下拉（5.9.3 实测）
-
-| 方式 | 返回 | 实际效果 |
-|---|---|---|
-| `__wbInvoke('session:setModel', {sessionId, modelId})` | `{success:true}` | ✗ 下一条消息仍用旧模型 |
-| `workbuddyDesktop.setSessionModel(...)` | 对象/`unsupported` | ✗ 本版本没有该方法 |
-| 点 `.cr-model-selector__list` 里对应项 | React `onSelect` | ✅ 真实切换 |
-
-原因：官方切换完全发生在渲染层 —— 下拉项 onClick → 输入框 store `api.setModel(selection)` →
-`onChange` → 发送时 `ensureSessionModelBeforeSend` / `resolveAndSyncSessionModel` 才把模型同步进
-ACP 会话；`session:setModel` 只改了主进程里的会话记录，没有通知跑 Agent 的 ACP 连接。
-验证方式：点完看触发器 `aria-label` 是否变成 `Select model: <名称>`，以及会话 jsonl 里
-`"model"` 字段（`~/.workbuddy/projects/<cwd>/<session>.jsonl`）。
 
 ## 2. 协议层（ACP / JSON-RPC）
 

@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { CDP, listTargets, pickMainTarget, waitForCdp, waitForDomReady, waitForMainTarget } from '../lib/cdp.mjs';
 import { DEFAULT_PLUGINS_DIR, loadPlugins, setPluginEnabled, watchPlugins } from '../lib/registry.mjs';
 import { appVersion, electronVersion, exePath, killAll, launch, loadConfig, loadPluginEnv, processCount } from '../lib/launcher.mjs';
@@ -124,13 +125,25 @@ function tailLog(lines = 25) {
     }
 }
 
+/** 按数值比较点分版本号：字符串比较会把 "20.9.0" 误判为 >= "20.10" */
+function versionAtLeast(actual, required) {
+    const a = String(actual).split('.').map((n) => parseInt(n, 10) || 0);
+    const b = String(required).split('.').map((n) => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        const x = a[i] ?? 0;
+        const y = b[i] ?? 0;
+        if (x !== y) return x > y;
+    }
+    return true;
+}
+
 async function cmdDoctor() {
     banner();
     const cfg = loadConfig();
     const checks = [];
     const push = (name, pass, note = '') => checks.push({ name, pass, note });
 
-    push('Node 版本 >= 20.10', Number(process.versions.node.split('.')[0]) >= 20 || process.versions.node >= '20.10', process.versions.node);
+    push('Node 版本 >= 20.10', versionAtLeast(process.versions.node, '20.10'), process.versions.node);
     push('全局 WebSocket 可用', typeof WebSocket === 'function', typeof WebSocket);
     push('appRoot 存在', fs.existsSync(cfg.appRoot), cfg.appRoot);
     let exe = '';
@@ -184,7 +197,10 @@ async function cmdStatus() {
     const { client, target } = await attach(cfg.port);
     try {
         const raw = await client.eval('window.__wbpro ? JSON.stringify(window.__wbpro.status()) : null');
-        console.log(`  目标: ${dim((target.title || '').slice(0, 50))} ${dim(target.url || '')}`);
+        // url 里带 wbSeedToken / accountSnapshot 等凭据，打印到终端或粘进 issue 就是泄露。
+        // 只留协议与路径，查询串整体隐去。
+        const safeUrl = String(target.url || '').replace(/\?.*$/, '?…');
+        console.log(`  目标: ${dim((target.title || '').slice(0, 50))} ${dim(safeUrl)}`);
         if (!raw) {
             console.log(warn('  运行中，但未注入插件运行时'));
             return;
@@ -381,18 +397,45 @@ function duoHookCommand() {
 
 function installDuoHooks({ remove = false } = {}) {
     const file = path.join(os.homedir(), '.workbuddy', 'settings.json');
-    let settings = {};
-    try {
-        settings = JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch {
-        settings = {};
+
+    // 装之前先确认脚本真的在：否则会往 hooks 里塞一条指向不存在文件的命令，
+    // 用户每次提交 prompt 都要白跑一次失败进程。
+    const script = path.join(DEFAULT_PLUGINS_DIR, 'dual-model', 'hooks', 'router.mjs');
+    if (!remove && !fs.existsSync(script)) {
+        console.log(dim(`  跳过 hook 安装：${script} 不存在（先装 dual-model 插件）`));
+        return false;
     }
+
+    // 读不到 / 解析失败时绝对不能当成 {} 再写回去——那会把用户整个配置清空。
+    // 拿不到可信的现有内容就放弃修改，并明确告知。
+    let settings;
+    let existed = true;
+    try {
+        const raw = fs.readFileSync(file, 'utf8');
+        settings = raw.trim() ? JSON.parse(raw) : {};
+    } catch (e) {
+        if (e.code === 'ENOENT') {
+            existed = false;
+            settings = {};
+        } else {
+            console.log(bad(`  跳过 hook 安装：${path.basename(file)} 无法解析（${e.message}）`));
+            console.log(dim('  为避免覆盖你的其它配置，此处不做任何写入。修好该文件后重试。'));
+            return false;
+        }
+    }
+    if (settings === null || typeof settings !== 'object' || Array.isArray(settings)) {
+        console.log(bad(`  跳过 hook 安装：${path.basename(file)} 顶层不是对象`));
+        return false;
+    }
+
     const hooks = settings.hooks && typeof settings.hooks === 'object' ? settings.hooks : {};
-    const marker = path.join(DEFAULT_PLUGINS_DIR, 'dual-model', 'hooks', 'router.mjs');
 
     for (const ev of DUO_HOOK_EVENTS) {
         const list = Array.isArray(hooks[ev]) ? hooks[ev] : [];
-        const kept = list.filter((g) => JSON.stringify(g).indexOf('dual-model') === -1 || JSON.stringify(g).indexOf('router.mjs') === -1);
+        const kept = list.filter((g) => {
+            const s = JSON.stringify(g);
+            return !(s.indexOf('dual-model') > -1 && s.indexOf('router.mjs') > -1);
+        });
         if (!remove) {
             kept.push({
                 matcher: ev === 'UserPromptSubmit' ? '*' : 'Agent',
@@ -405,20 +448,29 @@ function installDuoHooks({ remove = false } = {}) {
     if (Object.keys(hooks).length) settings.hooks = hooks;
     else delete settings.hooks;
 
+    // 先写临时文件再 rename，避免写一半崩掉留下半截 JSON
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n', 'utf8');
-    console.log(remove ? ok(`  已移除主从路由 hook`) : ok(`  已安装主从路由 hook → ${path.basename(file)}`));
+    const tmp = `${file}.wbpro.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmp, file);
+
+    if (remove) console.log(ok(`  已移除主从路由 hook`));
+    else if (existed) console.log(ok(`  已安装主从路由 hook → ${path.basename(file)}`));
+    else console.log(ok(`  已创建 ${path.basename(file)} 并安装主从路由 hook`));
+    return true;
 }
 
 async function cmdDemo() {
     banner();
     const cfg = loadConfig();
     const ifMissing = has('--if-missing');
-    const src = new URL('../plugins_pro/', import.meta.url);
-    const srcDir = src.pathname.replace(/^\/([A-Za-z]:)/, '$1');
+    // 必须用 fileURLToPath：URL.pathname 会把非 ASCII 路径百分号编码，
+    // 项目放在中文目录下时 readdir 直接 ENOENT。
+    const srcDir = fileURLToPath(new URL('../plugins_pro/', import.meta.url));
     fs.mkdirSync(cfg.pluginsDir, { recursive: true });
     let copied = 0;
     let skipped = 0;
+    let dualModelSynced = false;
     for (const name of fs.readdirSync(srcDir)) {
         const from = path.join(srcDir, name);
         if (!fs.statSync(from).isDirectory()) continue;
@@ -427,6 +479,15 @@ async function cmdDemo() {
         const readVer = (dir) => {
             try {
                 return JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf8')).version || '0.0.0';
+            } catch {
+                return null;
+            }
+        };
+        /** 读目标插件里用户自己的 enabled 选择，覆盖时必须保留 */
+        const readEnabled = (dir) => {
+            try {
+                const m = JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf8'));
+                return m.enabled === false ? false : true;
             } catch {
                 return null;
             }
@@ -452,15 +513,36 @@ async function cmdDemo() {
             skipped++;
             continue;
         }
+
+        // 覆盖前记住用户的启用状态：否则每次启动都会把手动停用的插件又打开
+        const userEnabled = fs.existsSync(to) ? readEnabled(to) : null;
+
         fs.cpSync(from, to, { recursive: true });
+
+        if (userEnabled === false) {
+            const manifestFile = path.join(to, 'plugin.json');
+            try {
+                const m = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+                if (m.system !== true) {
+                    m.enabled = false;
+                    fs.writeFileSync(manifestFile, JSON.stringify(m, null, 2) + '\n', 'utf8');
+                }
+            } catch {
+                /* 清单坏了就跳过，不影响其它插件 */
+            }
+        }
+
+        if (name === 'dual-model') dualModelSynced = true;
         const why = dstVer === null ? '' : outdated ? `  ${dim(`${dstVer} → ${srcVer}`)}` : '';
-        console.log(`  ${ok('复制')} ${name}${why}`);
+        const keep = userEnabled === false ? dim('  （保持停用）') : '';
+        console.log(`  ${ok('复制')} ${name}${why}${keep}`);
         copied++;
     }
     if (skipped) console.log(dim(`\n  ${copied} 个已同步，${skipped} 个已存在跳过（--if-missing）`));
     else console.log(dim(`\n  ${copied} 个插件已就位`));
     console.log(dim(`  插件目录：${cfg.pluginsDir}`));
-    installDuoHooks();
+    // 只有真的装了 dual-model 才去动 settings.json
+    if (dualModelSynced) installDuoHooks();
 }
 
 async function main() {
