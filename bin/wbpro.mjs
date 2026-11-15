@@ -29,6 +29,15 @@ const warn = color(33);
 const bad = color(31);
 const bold = color(1);
 
+/** 时间戳：HH:MM:SS（本地时间）。
+ *  热更新的日志会落到 wbpro.log，没有时间戳就没法判断「这次注入是什么时候发生的」，
+ *  也没法把一次界面闪烁和一次注入对上。 */
+function ts(date) {
+    const d = date || new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 function banner() {
     console.log(bold(`\nwbpro · WorkBuddy 插件读取管理器`));
 }
@@ -224,7 +233,14 @@ async function interactive() {
     let injector = null;
     let stopWatch = null;
 
-    const doInject = async (reason) => {
+    // 上一次注入的时刻（epoch ms）。控制服务把它给插件管理器，
+    // 这样终端打印的时间戳和面板显示的「上次热更新」是同一个值，而不是各读各的时钟。
+    let lastInjectAt = 0;
+
+    const doInject = async (reason, at) => {
+        // at：这次变更被检测到的时刻。热更新时由 watcher 传进来，
+        // 让「检测到变更」和「已注入」两行用同一个时间戳。
+        const stamp = at instanceof Date ? at : new Date();
         const { plugins, errors, missing } = await loadPlugins(cfg.pluginsDir);
         if (missing) console.log(warn(`  插件目录不存在，已创建：${cfg.pluginsDir}`));
         for (const e of errors) console.log(bad(`  [跳过] ${e.dir}: ${e.reason}`));
@@ -232,7 +248,8 @@ async function interactive() {
         const r = await loadAndInject({ injector, plugins, meta, backends });
         backends = r.backends;
         const live = plugins.filter((p) => typeof p.code === 'string').length;
-        console.log(`  ${ok('已注入')} ${live} 个 UI 插件 · ${r.sizeKb} KB · ${dim(reason)}`);
+        lastInjectAt = stamp.getTime();
+        console.log(`  ${dim(ts(stamp))} ${ok('已注入')} ${live} 个 UI 插件 · ${r.sizeKb} KB · ${dim(reason)}`);
         for (const p of plugins) {
             console.log(`    ${dim('•')} ${bold(p.id)} ${dim('v' + p.version)}${p.backendUrl ? dim(` backend=${p.backendUrl}`) : ''}`);
         }
@@ -265,9 +282,16 @@ async function interactive() {
             }
         }
         if (!stopWatch) {
-            stopWatch = watchPlugins(cfg.pluginsDir, () => {
-                console.log(dim('\n  检测到插件变更，热更新…'));
-                doInject('热更新').catch((e) => console.log(bad(`  热更新失败: ${e.message}`)));
+            stopWatch = watchPlugins(cfg.pluginsDir, (files) => {
+                // 只留文件名：fs.watch 递归模式下连目录本身也会报一条，混进来反而看不清
+                const list = (Array.isArray(files) ? files : []).filter((n) => /\.[^/]+$/.test(n));
+                const what = list.length
+                    ? '（' + list.slice(0, 3).join(', ') + (list.length > 3 ? ` 等 ${list.length} 个` : '') + '）'
+                    : '';
+                const at = new Date();
+                console.log(dim(`\n  ${ts(at)}  检测到插件变更${what}，热更新…`));
+                // 同一个 at 传下去：紧跟着的「已注入」行与面板显示的时间完全一致
+                doInject('热更新', at).catch((e) => console.log(bad(`  ${ts(at)}  热更新失败: ${e.message}`)));
             });
         }
     };
@@ -291,6 +315,7 @@ async function interactive() {
         },
         setEnabled: (id, enabled) => setPluginEnabled(cfg.pluginsDir, id, enabled),
         reload: () => doInject('管理面板触发热更新'),
+        getLastReload: () => lastInjectAt,
     });
     meta.controlUrl = ctl.url;
     meta.controlToken = ctl.token;
@@ -693,7 +718,7 @@ async function main() {
                 if (!body.ok) throw new Error(`控制服务返回 ${res.status}`);
                 await sleep(1200);
                 const st = await client.eval('window.__wbpro.status()');
-                console.log(ok(`  已热更新`));
+                console.log(ok(`  ${ts()}  已热更新`));
                 for (const p of st?.plugins || []) {
                     console.log(dim(`    ${p.id.padEnd(16)} ${p.version}${p.error ? '  ✗ ' + p.error : ''}`));
                 }

@@ -894,6 +894,11 @@ function activate(ctx) {
     // 本会话里「我们亲手写过」的键。服务端回包 / 拉起时读到的旧 snapshot
     // 一律不许覆盖它们，否则会出现「刚点开又被改回 false」的闪回。
     var dirtyKeys = {};
+    // 服务端（runtime.json）里 duo 的最近一次已知值。
+    // 重要：hook 注入规则**只读 runtime.json**，不看页面状态。
+    // 所以这两个值一旦分叉，界面显示「已启用」但规则根本没下发——
+    // 表现就是「主从模式下主模型完全不按规则走」。面板里要能看出来。
+    var serverDuoSeen = null;
 
     function readLocalCfg() {
         try {
@@ -960,6 +965,7 @@ function activate(ctx) {
             .then(function (r) {
                 controlOk = true;
                 var c = (r && r.config) || {};
+                if (typeof c.duo === 'boolean') serverDuoSeen = c.duo;
                 if (pendingSync && local) {
                     // 本地更新过，别让旧的 runtime.json 覆盖掉
                     return trySyncPending();
@@ -1008,6 +1014,7 @@ function activate(ctx) {
                 controlOk = true;
                 pendingSync = false;
                 var c = (r && r.config) || {};
+                if (typeof c.duo === 'boolean') serverDuoSeen = c.duo;
                 // 服务端回包可能是「本次写入之前」的快照（并发写 / 旧缓存）。
                 // 凡是本会话由我们写过的键（dirtyKeys），一律以本地为准，不采信回包。
                 var safe = {};
@@ -1414,6 +1421,17 @@ function activate(ctx) {
             duoStat.flips +
             (duoStat.at ? '（最近进入 ' + new Date(duoStat.at).toLocaleTimeString() + '）' : '');
         diag.appendChild(dp);
+
+        // hook 只认 runtime.json；和界面不一致时，规则不会下发。
+        var dg = document.createElement('div');
+        dg.style.marginTop = '2px';
+        var mismatch = serverDuoSeen !== null && serverDuoSeen !== state.duo;
+        dg.textContent =
+            '规则注入：runtime.json duo = ' +
+            (serverDuoSeen === null ? '未知（控制服务未连上）' : serverDuoSeen ? 'true' : 'false') +
+            (mismatch ? '  ⚠ 与界面不一致，规则不会生效' : '');
+        if (mismatch) dg.style.color = '#e0a33e';
+        diag.appendChild(dg);
         body.appendChild(diag);
 
         renderPhaseRow();

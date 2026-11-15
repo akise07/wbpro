@@ -8,6 +8,20 @@ var NAV_FLAG = 'data-wbpro-nav';
 var ICON_PUZZLE =
     'M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 1.998c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z';
 
+/* ---------- 热更新时间 ---------- */
+
+// 上次成功热更新的时间点。列表每 4 秒自动刷新一次，所以存在模块作用域里，
+// 每次重绘都带出来，而不是只闪一下 toast 就没了。
+var lastReloadAt = 0;
+
+function hhmmss(t) {
+    var d = new Date(t);
+    var p = function (n) {
+        return (n < 10 ? '0' : '') + n;
+    };
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
 /* ---------- DOM 定位 ---------- */
 
 // 找到文本完全等于 target 的叶子节点（取渲染面积最小的那个）
@@ -214,7 +228,8 @@ function activate(ctx) {
                 var head = document.createElement('div');
                 head.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:8px;';
                 var count = document.createElement('span');
-                count.style.cssText = 'flex:1;font-size:12px;opacity:.6;';
+                count.style.cssText =
+                    'flex:1;font-size:12px;opacity:.6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
                 count.textContent = '读取中…';
                 var refresh = document.createElement('button');
                 refresh.textContent = '热更新';
@@ -223,6 +238,7 @@ function activate(ctx) {
                     ctx.control
                         .reload()
                         .then(function () {
+                            lastReloadAt = Date.now();
                             setTimeout(load, 300);
                         })
                         .catch(function (e) {
@@ -255,7 +271,17 @@ function activate(ctx) {
                     list.textContent = '';
                     var items = (data.plugins || []).slice();
                     var on = items.filter(function (p) { return p.enabled; }).length;
-                    count.textContent = items.length + ' 个插件 · ' + on + ' 个启用';
+                    // 时间以控制服务返回的 reloadAt 为准：那是 wbpro up 每次注入后写下的同一份值，
+                    // 和终端里打印的时间戳完全一致。取两者的较大值是为了补上时序差——
+                    // 点「热更新」后注入要 100ms 才发生，那之前服务端给的还是上一次的时间。
+                    var shownAt = Math.max(Number((data && data.reloadAt) || 0), lastReloadAt);
+                    count.textContent =
+                        items.length +
+                        ' 个插件 · ' +
+                        on +
+                        ' 个启用' +
+                        (shownAt ? ' · 上次热更新 ' + hhmmss(shownAt) : '');
+                    count.title = count.textContent;
                     dirTip.textContent = data.dir || '';
                     dirTip.title = data.dir || '';
 
