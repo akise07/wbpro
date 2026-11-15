@@ -648,6 +648,11 @@ function activate(ctx) {
                         'background-color:transparent!important;background-image:none!important;box-shadow:none!important}',
                     'html.wbpro-duo-mode [data-wbpro-duo-item].cr-model-selector__item--selected{' +
                         'background-color:rgba(127,119,221,.16)!important}',
+                    // 隐形打开：切换模型时临时弹出的下拉不可见（fiber 仍存在，事件照常）。
+                    // 放在 CSS 里而不是逐个改 style，是为了覆盖"刚创建还没被 JS 摸到"的首帧。
+                    'html.wbpro-veil .cr-model-selector__popover,' +
+                        'html.wbpro-veil .cr-model-selector__menu,' +
+                        'html.wbpro-veil .cr-popover{visibility:hidden!important;pointer-events:none!important}',
                 ].join('\n'),
             );
         } catch (e) {
@@ -689,7 +694,7 @@ function activate(ctx) {
                         sid !== appliedSession &&
                         Date.now() - (applyStat.lastFailAt || 0) > 60000 // 失败后 1 分钟内不反复重试，免得刷屏
                     ) {
-                        applyMainModel('session-change');
+                        applyMainModel('session-change', 0, false, { quiet: true });
                     }
                 }, 120);
             });
@@ -766,7 +771,7 @@ function activate(ctx) {
         applyTriggerLabel();
         // 插件重载 / 页面刷新后，已有的协作状态要把模型真正下发一次，
         // 否则界面是「主从模型」，跑的却是别的模型。
-        if (state.duo) setTimeout(function () { applyMainModel('boot'); }, 1000);
+        if (state.duo) setTimeout(function () { applyMainModel('boot', 0, false, { quiet: true }); }, 1000);
         document.documentElement.classList.toggle('wbpro-duo-mode', state.duo);
         renderChip();
     }
@@ -1270,7 +1275,15 @@ function activate(ctx) {
     }
 
     /** 把当前会话模型切到 state.mainModel。force 用于面板里的手动重试（不要求已开协作） */
-    function applyMainModel(reason, attempt, force) {
+    /**
+     * 把当前会话模型切到 state.mainModel。
+     *
+     * opts.quiet = true 表示后台触发（boot / 切会话）：这种时候**不主动打开下拉**，
+     * 下拉没开就直接放弃。原因见 switchModelViaUI 的"隐形打开"说明 —— 隐形只是不可见，
+     * 焦点和弹层状态仍然会动；后台悄悄做这事，万一和用户正在操作撞上，会显得界面自己在跳。
+     * 用户主动触发的场景（点主从行、面板保存、手动重试）才允许打开。
+     */
+    function applyMainModel(reason, attempt, force, opts) {
         if (!alive()) return Promise.resolve(false);
         if (!state.duo && !force) return Promise.resolve(false);
         var want = String(state.mainModel || '').trim();
@@ -1284,7 +1297,7 @@ function activate(ctx) {
             attempt = attempt || 0;
             if (attempt < 3) {
                 return new Promise(function (res) {
-                    setTimeout(function () { res(applyMainModel(reason, attempt + 1)); }, 600);
+                    setTimeout(function () { res(applyMainModel(reason, attempt + 1, force, opts)); }, 600);
                 });
             }
             applyStat.err = '未识别到会话 ID';
@@ -1297,7 +1310,7 @@ function activate(ctx) {
 
         // 首选：官方下拉项的 React 回调。这是唯一能写进渲染层 store 的通道 ——
         // IPC 只改主进程的会话记录，下一条消息仍按 store 里的旧模型发送（已实测）。
-        return switchModelViaUI(want)
+        return switchModelViaUI(want, { quiet: !!(opts && opts.quiet) })
             .then(function (r) {
                 if (r.ok) {
                     applyStat.ok++;
@@ -1339,7 +1352,9 @@ function activate(ctx) {
             });
     }
 
-    /** 退出协作时把进入前的官方模型还回去（同样只能走 UI 通道） */
+    /** 退出协作时把进入前的官方模型还回去（同样只能走 UI 通道）。
+     *  这里允许打开下拉（非 quiet）：退出主从是用户主动操作，静默失败会让模型停在
+     *  主模型上，比"下拉动一下"更让人困惑。 */
     function restorePrevModel() {
         var back = String(state.prevModel || '').trim();
         if (!back) return;
@@ -1659,11 +1674,21 @@ function activate(ctx) {
 
     /**
      * 通过官方下拉把当前会话模型切到 modelId。
-     * 下拉没开就临时打开（用 openedByUs 记住，结束后收起来），开着就直接点。
      * 返回 { ok, detail, strategy } —— ok 以界面回查为准，不看返回值。
+     *
+     * **为什么要"隐形打开"**
+     * 切换唯一有效的入口是下拉项的 `ModelItem.props.onSelect`，而 fiber 只在下拉
+     * 渲染时存在 —— 不打开下拉就拿不到它，所以"打开"这一步绕不过去。
+     * 但"打开"不等于"让人看见"：把浮层在打开的那一瞬间设为不可见，
+     * 布局、fiber、事件委托全都正常，只有视觉上是透明的。用户看到的就是
+     * 「点了一下主从模型，模型已经换好了」，中间没有下拉一闪。
+     *
+     * 只在**我们自己打开**时隐藏（openedByUs）。如果用户本来就把下拉开着了，
+     * 那是他自己的界面，绝不能动手脚 —— 那种情况下本来也不存在"闪"。
      */
-    function switchModelViaUI(modelId) {
+    function switchModelViaUI(modelId, opts) {
         if (!alive()) return Promise.resolve({ ok: false, detail: '实例已卸载' });
+        var quiet = !!(opts && opts.quiet);
         var want = shortName(modelId);
         var trig = document.querySelector('.cr-model-selector__trigger');
         if (!trig) return Promise.resolve({ ok: false, detail: '当前页面没有模型选择器' });
@@ -1671,18 +1696,34 @@ function activate(ctx) {
 
         var focusBack = document.activeElement;
         var openedByUs = false;
+        var veil = null;
+
         if (!document.querySelector(MENU_LIST)) {
+            // 后台触发（boot / 切会话）不主动开下拉：隐形只是看不见，焦点和弹层状态
+            // 仍然会动，和用户操作撞上就会显得界面自己在跳。等下一次用户交互再说。
+            if (quiet) return Promise.resolve({ ok: false, detail: '下拉未打开，后台触发时跳过' });
+            // 先挂"隐形"标记，再点开 —— 顺序不能反：点开是同步渲染的，
+            // 先点后藏会有一帧可见（就是用户看到的"闪一下"）。
+            veil = beginVeil();
             trig.click();
             openedByUs = true;
         }
 
         function done(res) {
-            if (openedByUs) setTimeout(closeModelPopover, 120);
+            if (openedByUs) {
+                setTimeout(function () {
+                    closeModelPopover();
+                    // 收起动画结束后再摘掉隐形，避免"摘了但还没收完"那一帧又露出来
+                    setTimeout(function () { endVeil(veil); }, 200);
+                }, 80);
+            } else {
+                endVeil(veil);
+            }
             // 临时点开下拉会抢焦点，操作完还给原来的输入框，别打断用户打字
             if (openedByUs && focusBack && focusBack.focus) {
                 setTimeout(function () {
                     try { focusBack.focus(); } catch (e) { /* ignore */ }
-                }, 200);
+                }, 240);
             }
             return res;
         }
@@ -1713,6 +1754,66 @@ function activate(ctx) {
                 return { ok: false, detail: String((e && e.message) || e) };
             })
             .then(done);
+    }
+
+    /* ---------- 隐形打开：让临时弹出的下拉不可见 ---------- */
+
+    var VEIL_ATTR = 'data-wbpro-veil';
+    var VEIL_CLASS = 'wbpro-veil';
+    var veilObserver = null;
+
+    /**
+     * 开始隐形。浮层是 portal 渲染的（挂在 body 末尾），且打开瞬间才创建，
+     * 所以不能只给一个已知节点打标记 —— 用 MutationObserver 盯着，
+     * 一出现就立刻套上样式，同时给 body 加一个类兜住首帧。
+     *
+     * 用 `visibility:hidden` 而不是 `display:none`：
+     * display:none 会让元素不参与布局，某些弹层库会据此判定"未挂载"而提前卸载内容，
+     * 那样 fiber 就没了。visibility 只影响绘制，布局与 fiber 全部保留。
+     */
+    function beginVeil() {
+        var veil = { active: true };
+        // 这条类规则兜住"点了但 React 还没渲染完"的首帧：
+        // 节点一出现就是隐藏的，不必等 MutationObserver 回调（那要等到下一微任务）。
+        document.documentElement.classList.add(VEIL_CLASS);
+
+        function paint() {
+            if (!veil.active) return;
+            var sel = '.cr-model-selector__popover, .cr-model-selector__menu, .cr-popover';
+            var nodes = document.querySelectorAll(sel);
+            for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                if (n.getAttribute(VEIL_ATTR)) continue;
+                n.setAttribute(VEIL_ATTR, '1');
+                n.style.visibility = 'hidden';
+                n.style.pointerEvents = 'none';
+            }
+        }
+        paint();
+
+        if (!veilObserver) {
+            veilObserver = new MutationObserver(paint);
+            veilObserver.observe(document.body, { childList: true, subtree: true });
+        }
+        veil.paint = paint;
+        return veil;
+    }
+
+    function endVeil(veil) {
+        if (!veil || !veil.active) return;
+        veil.active = false;
+        document.documentElement.classList.remove(VEIL_CLASS);
+        if (veilObserver) {
+            try { veilObserver.disconnect(); } catch (e) { /* ignore */ }
+            veilObserver = null;
+        }
+        var nodes = document.querySelectorAll('[' + VEIL_ATTR + ']');
+        for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            n.removeAttribute(VEIL_ATTR);
+            n.style.visibility = '';
+            n.style.pointerEvents = '';
+        }
     }
 
     /** 当前官方档位的显示名（我们的覆盖标签之前调用） */
