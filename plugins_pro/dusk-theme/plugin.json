@@ -5,8 +5,15 @@
   "description": "整屏色调切换：暮色 / 冷夜 / 护眼 / 去色，可随时还原",
   "renderer": "renderer.js",
   "managed": true,
-  "permissions": ["ui.panel", "ui.css", "storage"],
+  "permissions": [
+    "ui.panel",
+    "ui.css",
+    "storage"
+  ],
   "contributes": {
-    "panel": { "position": "bottom-right" }
-  }
+    "panel": {
+      "position": "bottom-right"
+    }
+  },
+  "enabled": false
 }

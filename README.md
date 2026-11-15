@@ -1,6 +1,9 @@
 # wbpro · WorkBuddy 运行时插件管理器
 
-给官方 WorkBuddy 加一层**不写入任何官方文件**的插件系统：插件放在 `~/.workbuddy/plugins_pro/<插件名>/`，能改界面、能跑自己的后端进程，**官方升级后不用重新打包**。
+给官方 WorkBuddy 加一层**不写入任何官方文件**的插件系统：插件就放在仓库的 `plugins_pro/<插件名>/`，能改界面、能跑自己的后端进程，**官方升级后不用重新打包**。
+
+> **只有一个来源**：运行时直接读仓库里的 `plugins_pro`，不再复制到 `~/.workbuddy/plugins_pro`。
+> 以前那份副本带来的是「改源码忘了复制 / hook 指向旧副本 / 删副本丢配置」这类问题，现在把这些可能性一次性去掉。
 
 ---
 
@@ -30,7 +33,7 @@ wbpro up
   ├─ 启动 WorkBuddy.exe，带 WORKBUDDY_REMOTE_DEBUGGING_PORT
   ├─ 轮询 127.0.0.1:<port>/json/list 直到渲染进程就绪
   ├─ 选中主窗口 target，建立 WebSocket（CDP）
-  ├─ 读 ~/.workbuddy/plugins_pro/*/plugin.json
+  ├─ 读 <仓库>/plugins_pro/*/plugin.json
   ├─ 为有 backend 的插件拉起独立 Node 进程（分配空闲端口）
   ├─ 把「运行时 + 全部插件源码」拼成一个 bundle，Runtime.evaluate 注入
   └─ 常驻：监听插件目录变化热更新、页面刷新后自动重注、应用重启后自动重连
@@ -44,16 +47,23 @@ wbpro up
 cd wbpro
 
 node bin/wbpro.mjs doctor     # 环境体检
-node bin/wbpro.mjs demo       # 把示例插件复制到 ~/.workbuddy/plugins_pro
+node bin/wbpro.mjs demo       # 校验插件目录并安装 hook（不再复制）
 node bin/wbpro.mjs up         # 启动 WorkBuddy 并注入（用这个方式启动才有插件）
 node bin/wbpro.mjs reload     # 改了插件不想重启应用：热替换一遍
 node bin/wbpro.mjs status     # 查看已激活插件
 node bin/wbpro.mjs list       # 列出插件目录
 ```
 
-**或者直接双击 `start.bat`**：自动定位 Node → 同步随包插件 → 带调试端口启动 → 注入 → 常驻（窗口开着别关）。
+**或者直接双击 `start.bat`**：自动定位 Node → 校验插件目录并重装 hook → 带调试端口启动 → 注入 → 常驻（窗口开着别关）。
 
-`start.bat` 里的同步用的是 `demo --if-missing`：标记了 `system: true`（插件管理器）或 `managed: true`（随包示例）的插件**每次都会覆盖更新**，你自己建的插件目录不会被碰。覆盖时会**保留你在管理面板里的启用/停用选择**，不会因为重启又被悄悄打开。
+`start.bat` 的第一步是 `demo`（`--if-missing` 已经不需要了）。它**不再复制任何插件**——
+插件就长在 `plugins_pro` 里，运行时直接读。这一步实际做两件事：
+
+1. 列出插件，确认目录可用（目录不存在时以**退出码 1** 结束，批处理会停在这里，不会带病启动）；
+2. 重装 hook，让 `settings.json` 里的脚本路径指向当前目录的绝对路径。
+
+第 2 点很实用：仓库挪位置后，hook 里存的绝对路径就失效了，双击一次 `start.bat` 就自动纠正。
+（沙箱里改不了 `settings.json`，所以这个纠正动作只能在你自己终端做。）
 
 已经开着 WorkBuddy 时：
 
@@ -93,7 +103,7 @@ wbpro/
 │  ├─ bundle.mjs            运行时与插件拼装
 │  └─ injector.mjs          注入 + 后端进程托管
 ├─ runtime/bootstrap.js     注入到页面的插件宿主（UI/存储/IPC API）
-└─ plugins_pro/             示例插件（运行时会复制到用户目录）
+└─ plugins_pro/             插件目录（唯一来源，运行时直接读取）
    ├─ plugin-manager/       内置：左侧栏「插件管理」入口 + 列表/启停/热更新
    ├─ hello-panel/          浮动面板 + 宿主信息
    ├─ dusk-theme/           整屏色调切换（暮色/冷夜/护眼/去色）
@@ -103,7 +113,7 @@ wbpro/
 ## 5. 插件格式
 
 ```
-~/.workbuddy/plugins_pro/我的插件/
+<仓库>/plugins_pro/我的插件/
 ├─ plugin.json
 ├─ renderer.js      （可选）注入到页面的 UI 逻辑
 └─ backend.cjs      （可选）独立后端进程
@@ -314,11 +324,13 @@ up 终端：   11:34:36  检测到插件变更（dual-model/renderer.js），热
 `CODEBUDDY.md` 里粘规则。hook 装在 `~/.workbuddy/settings.json` 的 `hooks` 字段，由 `wbpro up` /
 `demo` 自动安装（`node bin/wbpro.mjs hooks` 手动装，`hooks --remove` 卸掉）。
 
-> **⚠️ 改完 `plugins_pro/dual-model/hooks/router.mjs` 必须跑一次 `node bin/wbpro.mjs demo`。**
-> hook 执行的是 `~/.workbuddy/plugins_pro/dual-model/hooks/router.mjs` 这份**副本**，
-> 不是仓库里的源码。踩过：改了契约措辞但没同步，子代理收到的仍是旧版「验证一律不归你管」，
-> 表现和改了完全不一样，还很难从现象上看出原因。
-> 校验一行：`wc -c` 两个路径的字节数应当相同。
+> **改了 `plugins_pro/dual-model/hooks/router.mjs` 直接生效，不用再 demo。**
+> hook 执行的就是仓库里这份脚本，每次事件都会重新起一个 `node` 进程，文件改完下一次就用了。
+> 只有**目录变了**（比如整个仓库挪位置）才需要重装 hook，因为 `settings.json` 里存的是绝对路径：
+> `node bin/wbpro.mjs hooks`。
+>
+> 以前不是这样：hook 指向 `~/.workbuddy/plugins_pro/...` 那份副本，改源码不跑 `demo` 就完全不生效，
+> 现象和改动完全对不上，极难倒推。现在副本没了，这个坑也跟着消失了。
 
 ### 职责边界：子代理只执行，验收判定归主模型
 
@@ -562,7 +574,7 @@ node plugins_pro/cdp-guard/selftest.mjs   # 自测，20 条用例
 
 放行的：`down|stop|status|doctor|demo|hooks|list`，以及普通命令、其它端口的本地服务。
 端口从 `wbpro.config.json` 读，缺省 9333；也认 `WORKBUDDY_REMOTE_DEBUGGING_PORT`。
-每次拦截会写一行到 `~/.workbuddy/plugins_pro/cdp-guard/deny.log`。
+每次拦截会写一行到 `<仓库>/plugins_pro/cdp-guard/deny.log`。
 
 **为什么必须做成 hook**：写在 prompt 里的规则只是建议，模型会打折扣；改配置 + 起进程这类动作，
 只有宿主层面的 deny 才真的拦得住。
@@ -753,7 +765,7 @@ await window.__wbInvoke('config:getProductConfiguration')   // → { models: 66,
 | 热更新（改文件后自动重注入） | `wbpro up` 在跑 | 需要手动 `wbpro inject` 或重启 |
 | 主模型切换 | `__wbInvoke('session:setModel', ...)` | 通道只回 `{success:true}`、不回模型 id，因此面板显示「已请求切换，以界面为准」 |
 
-**配置存放**：`~/.workbuddy/plugins_pro/dual-model/runtime.json`。页面侧通过控制服务的 `/api/config/dual-model` 读写，`wbpro` 启动时读同一份文件注入环境变量。
+**配置存放**：`<仓库>/plugins_pro/dual-model/runtime.json`。页面侧通过控制服务的 `/api/config/dual-model` 读写，`wbpro` 启动时读同一份文件注入环境变量。
 
 **`saveConfig` 只允许回灌本次改动的键**——这是踩过的坑，写下来免得再犯：
 

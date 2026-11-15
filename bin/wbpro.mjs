@@ -8,7 +8,7 @@ import process from 'node:process';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { CDP, listTargets, pickMainTarget, waitForCdp, waitForDomReady, waitForMainTarget } from '../lib/cdp.mjs';
-import { DEFAULT_PLUGINS_DIR, loadPlugins, setPluginEnabled, watchPlugins } from '../lib/registry.mjs';
+import { loadPlugins, setPluginEnabled, watchPlugins } from '../lib/registry.mjs';
 import { appVersion, electronVersion, exePath, killAll, launch, loadConfig, loadPluginEnv, processCount } from '../lib/launcher.mjs';
 import { Injector, attach, loadAndInject } from '../lib/injector.mjs';
 import { startControl } from '../lib/control.mjs';
@@ -404,9 +404,6 @@ async function cmdUp() {
     return interactive();
 }
 
-/** 把仓库里自带的示例插件复制到用户插件目录。
- *  默认覆盖；--if-missing 时跳过已存在的非系统插件（保护用户改动），
- *  系统插件（plugin-manager）始终同步，避免管理器停留在旧版。 */
 /**
  * 把「主从路由」hook 装进 WorkBuddy 的 settings.json。
  * 两个事件都指向同一个脚本，脚本自己读 runtime.json 判断是否处于协作模式：
@@ -416,17 +413,23 @@ async function cmdUp() {
  */
 const DUO_HOOK_EVENTS = ['UserPromptSubmit', 'PreToolUse', 'PostToolUse'];
 
-function duoHookCommand() {
-    const script = path.join(DEFAULT_PLUGINS_DIR, 'dual-model', 'hooks', 'router.mjs');
+/** hook 里要执行的脚本绝对路径。插件目录以配置文件为准，不再硬编码用户目录。 */
+function resolvePluginsDir(opts = {}) {
+    return opts.pluginsDir || loadConfig().pluginsDir;
+}
+
+function duoHookCommand(opts = {}) {
+    const script = path.join(resolvePluginsDir(opts), 'dual-model', 'hooks', 'router.mjs');
     return `"${process.execPath}" "${script}"`;
 }
 
-function installDuoHooks({ remove = false } = {}) {
+function installDuoHooks(opts = {}) {
+    const { remove = false } = opts;
     const file = path.join(os.homedir(), '.workbuddy', 'settings.json');
 
     // 装之前先确认脚本真的在：否则会往 hooks 里塞一条指向不存在文件的命令，
     // 用户每次提交 prompt 都要白跑一次失败进程。
-    const script = path.join(DEFAULT_PLUGINS_DIR, 'dual-model', 'hooks', 'router.mjs');
+    const script = path.join(resolvePluginsDir(opts), 'dual-model', 'hooks', 'router.mjs');
     if (!remove && !fs.existsSync(script)) {
         console.log(dim(`  跳过 hook 安装：${script} 不存在（先装 dual-model 插件）`));
         return false;
@@ -465,7 +468,7 @@ function installDuoHooks({ remove = false } = {}) {
         if (!remove) {
             kept.push({
                 matcher: ev === 'UserPromptSubmit' ? '*' : 'Agent',
-                hooks: [{ type: 'command', command: duoHookCommand(), timeout: 10 }],
+                hooks: [{ type: 'command', command: duoHookCommand(opts), timeout: 10 }],
             });
         }
         if (kept.length) hooks[ev] = kept;
@@ -532,14 +535,15 @@ function writeSettingsFile(file, settings) {
  */
 const CDP_GUARD_MATCHER = 'Bash|PowerShell|WebFetch|WebSearch';
 
-function cdpGuardCommand() {
-    const script = path.join(DEFAULT_PLUGINS_DIR, 'cdp-guard', 'hooks', 'no-cdp.mjs');
+function cdpGuardCommand(opts = {}) {
+    const script = path.join(resolvePluginsDir(opts), 'cdp-guard', 'hooks', 'no-cdp.mjs');
     return `"${process.execPath}" "${script}"`;
 }
 
-function installCdpGuardHook({ remove = false } = {}) {
+function installCdpGuardHook(opts = {}) {
+    const { remove = false } = opts;
     const file = path.join(os.homedir(), '.workbuddy', 'settings.json');
-    const script = path.join(DEFAULT_PLUGINS_DIR, 'cdp-guard', 'hooks', 'no-cdp.mjs');
+    const script = path.join(resolvePluginsDir(opts), 'cdp-guard', 'hooks', 'no-cdp.mjs');
 
     if (!remove && !fs.existsSync(script)) {
         console.log(dim(`  跳过 CDP 守卫：${script} 不存在（先装 cdp-guard 插件）`));
@@ -571,7 +575,7 @@ function installCdpGuardHook({ remove = false } = {}) {
     if (!remove) {
         kept.push({
             matcher: CDP_GUARD_MATCHER,
-            hooks: [{ type: 'command', command: cdpGuardCommand(), timeout: 10 }],
+            hooks: [{ type: 'command', command: cdpGuardCommand(opts), timeout: 10 }],
         });
     }
     if (kept.length) hooks.PreToolUse = kept;
@@ -600,88 +604,30 @@ function installCdpGuardHook({ remove = false } = {}) {
 async function cmdDemo() {
     banner();
     const cfg = loadConfig();
-    const ifMissing = has('--if-missing');
-    // 必须用 fileURLToPath：URL.pathname 会把非 ASCII 路径百分号编码，
-    // 项目放在中文目录下时 readdir 直接 ENOENT。
-    const srcDir = fileURLToPath(new URL('../plugins_pro/', import.meta.url));
-    fs.mkdirSync(cfg.pluginsDir, { recursive: true });
-    let copied = 0;
-    let skipped = 0;
-    let dualModelSynced = false;
-    for (const name of fs.readdirSync(srcDir)) {
-        const from = path.join(srcDir, name);
-        if (!fs.statSync(from).isDirectory()) continue;
-        const to = path.join(cfg.pluginsDir, name);
-
-        const readVer = (dir) => {
-            try {
-                return JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf8')).version || '0.0.0';
-            } catch {
-                return null;
-            }
-        };
-        /** 读目标插件里用户自己的 enabled 选择，覆盖时必须保留 */
-        const readEnabled = (dir) => {
-            try {
-                const m = JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf8'));
-                return m.enabled === false ? false : true;
-            } catch {
-                return null;
-            }
-        };
-
-        let syncAlways = false;
-        try {
-            const m = JSON.parse(fs.readFileSync(path.join(from, 'plugin.json'), 'utf8'));
-            // 系统插件与随包发布的插件始终同步，避免管理器/示例停留在旧版
-            syncAlways = m.system === true || m.managed === true;
-        } catch {
-            /* 读不到就当普通插件 */
-        }
-
-        // 版本不同也强制同步：只靠 managed 标记容易漏（新插件忘了标就一直不更新），
-        // 版本号是唯一可靠信号。
-        const srcVer = readVer(from);
-        const dstVer = fs.existsSync(to) ? readVer(to) : null;
-        const outdated = srcVer && srcVer !== dstVer;
-
-        if (ifMissing && fs.existsSync(to) && !syncAlways && !outdated) {
-            console.log(`  ${dim('跳过')} ${name}（已存在 v${dstVer || '?'}）`);
-            skipped++;
-            continue;
-        }
-
-        // 覆盖前记住用户的启用状态：否则每次启动都会把手动停用的插件又打开
-        const userEnabled = fs.existsSync(to) ? readEnabled(to) : null;
-
-        fs.cpSync(from, to, { recursive: true });
-
-        if (userEnabled === false) {
-            const manifestFile = path.join(to, 'plugin.json');
-            try {
-                const m = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-                if (m.system !== true) {
-                    m.enabled = false;
-                    fs.writeFileSync(manifestFile, JSON.stringify(m, null, 2) + '\n', 'utf8');
-                }
-            } catch {
-                /* 清单坏了就跳过，不影响其它插件 */
-            }
-        }
-
-        if (name === 'dual-model') dualModelSynced = true;
-        const why = dstVer === null ? '' : outdated ? `  ${dim(`${dstVer} → ${srcVer}`)}` : '';
-        const keep = userEnabled === false ? dim('  （保持停用）') : '';
-        console.log(`  ${ok('复制')} ${name}${why}${keep}`);
-        copied++;
-    }
-    if (skipped) console.log(dim(`\n  ${copied} 个已同步，${skipped} 个已存在跳过（--if-missing）`));
-    else console.log(dim(`\n  ${copied} 个插件已就位`));
+    // 这个命令以前干的事是「把仓库里的 plugins_pro 复制到 ~/.workbuddy/plugins_pro」。
+    // 现在只有一个来源——仓库里的 plugins_pro，直接从那里读，所以复制这一步整个删掉了。
+    // 名字保留是因为 start.bat 和习惯用法都还叫它；`--if-missing` 现在没有意义，接受但忽略。
     console.log(dim(`  插件目录：${cfg.pluginsDir}`));
-    // 只有真的装了 dual-model 才去动 settings.json
-    if (dualModelSynced) installDuoHooks();
-    // 守卫与协作模式无关，装了就一直生效；脚本不存在时函数自己会跳过
-    installCdpGuardHook();
+
+    const { plugins, errors, missing } = await loadPlugins(cfg.pluginsDir, { includeDisabled: true });
+    if (missing) {
+        console.log(bad(`  插件目录不存在：${cfg.pluginsDir}`));
+        // 退出码要反映真实状态：start.bat 靠 errorlevel 判断要不要停在这里。
+        // 以前缺目录也退 0，批处理那层判断等于没有。
+        process.exitCode = 1;
+        return;
+    }
+    for (const e of errors) console.log(bad(`  [跳过] ${e.dir}: ${e.reason}`));
+    for (const p of plugins) {
+        const off = p.enabled === false ? dim('（已停用）') : '';
+        console.log(`  ${dim('•')} ${bold(p.id)} ${dim('v' + p.version)}${off}`);
+    }
+    const live = plugins.filter((p) => p.enabled !== false).length;
+    console.log(dim(`\n  ${plugins.length} 个插件 · ${live} 个启用 · 直接读取，不复制`));
+
+    // hook 里写的是脚本绝对路径，目录换了就必须重装，否则还指着旧副本
+    installDuoHooks({ pluginsDir: cfg.pluginsDir });
+    installCdpGuardHook({ pluginsDir: cfg.pluginsDir });
 }
 
 async function main() {

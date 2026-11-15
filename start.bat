@@ -21,12 +21,15 @@ if not defined NODE (
     exit /b 1
 )
 
-rem ---- step 1: sync bundled plugins ----
-echo [1/2] Syncing bundled plugins ...
-"%NODE%" bin\wbpro.mjs demo --if-missing
+rem ---- step 1: check plugins + install hooks ----
+rem Plugins are read straight from .\plugins_pro - nothing is copied into
+rem %USERPROFILE%\.workbuddy\plugins_pro any more. This step only lists them
+rem and reinstalls the hooks so they point at this folder's absolute paths.
+echo [1/2] Checking plugins and installing hooks ...
+"%NODE%" bin\wbpro.mjs demo
 if errorlevel 1 (
     echo.
-    echo [ERROR] Plugin sync failed. Check the message above.
+    echo [ERROR] Plugin check failed. Check the message above.
     pause
     exit /b 1
 )

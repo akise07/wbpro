@@ -10,14 +10,17 @@
  * 任何异常都必须 fail-open（输出 {}），绝不能挡住用户对话。
  */
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const RUNTIME =
-    process.env.WBPRO_DUO_RUNTIME ||
-    path.join(os.homedir(), '.workbuddy', 'plugins_pro', 'dual-model', 'runtime.json');
-const LOG = path.join(os.homedir(), '.workbuddy', 'plugins_pro', 'dual-model', 'hook.log');
-const PHASE = path.join(os.homedir(), '.workbuddy', 'plugins_pro', 'dual-model', 'phase.json');
+// 状态文件跟着插件走：路径由脚本自身位置推出来，不写死用户目录。
+// 以前写死 ~/.workbuddy/plugins_pro/...，插件目录一换（比如改成直接读仓库），
+// 这里就会静默读写一个已经不存在的副本。
+const PLUGIN_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+const RUNTIME = process.env.WBPRO_DUO_RUNTIME || path.join(PLUGIN_DIR, 'runtime.json');
+const LOG = path.join(PLUGIN_DIR, 'hook.log');
+const PHASE = path.join(PLUGIN_DIR, 'phase.json');
 
 function readCfg() {
     try {

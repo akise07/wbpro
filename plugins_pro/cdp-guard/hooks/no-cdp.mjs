@@ -21,8 +21,12 @@
  * 端口从 wbpro.config.json 读，缺省 9333；另支持 WORKBUDDY_REMOTE_DEBUGGING_PORT。
  */
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// 脚本自身位置 → 插件目录 → 仓库根。配置和日志都按这个推，不写死用户目录。
+const PLUGIN_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const REPO_ROOT = path.resolve(PLUGIN_DIR, '..', '..');
 
 const DEFAULT_PORT = 9333;
 
@@ -30,8 +34,8 @@ const DEFAULT_PORT = 9333;
 function resolvePort() {
     const candidates = [
         process.env.WBPRO_CONFIG,
+        path.join(REPO_ROOT, 'wbpro.config.json'),
         path.join(process.cwd(), 'wbpro.config.json'),
-        path.join(os.homedir(), '.workbuddy', 'plugins_pro', 'dual-model', 'wbpro.config.json'),
     ].filter(Boolean);
     for (const file of candidates) {
         try {
@@ -85,10 +89,10 @@ function deny(reason) {
     audit(reason);
 }
 
-/** 留痕，方便事后确认到底是哪条命令被拦了 */
+/** 留痕，方便事后确认到底是哪条命令被拦了（日志跟着插件目录走） */
 function audit(reason) {
     try {
-        const dir = path.join(os.homedir(), '.workbuddy', 'plugins_pro', 'cdp-guard');
+        const dir = PLUGIN_DIR;
         fs.mkdirSync(dir, { recursive: true });
         const line = `[${new Date().toISOString()}] ${reason}\n`;
         fs.appendFileSync(path.join(dir, 'deny.log'), line, 'utf8');
