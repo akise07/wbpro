@@ -28,19 +28,40 @@
 
 开启方式：`WORKBUDDY_REMOTE_DEBUGGING_PORT`（源码里的隐藏开关，无生产限制）。
 
-### 1.1 换模型：IPC 是假的，只能点下拉（5.9.3 实测）
+### 1.1 换模型：只能走渲染层，IPC 是空的（5.9.3 实测 + 11-15 二次复验）
 
 | 方式 | 返回 | 实际效果 |
 |---|---|---|
 | `__wbInvoke('session:setModel', {sessionId, modelId})` | `{success:true}` | ✗ 下一条消息仍用旧模型 |
-| `workbuddyDesktop.setSessionModel(...)` | 对象/`unsupported` | ✗ 本版本没有该方法 |
+| `__wbInvoke('session:setModel', sessionId, modelId)`（位置参数） | `{success:true}` | ✗ 同上，**参数形态不是原因** |
+| `workbuddyDesktop.setSessionModel(...)` | 不存在 / `unsupported` | ✗ 本版本没有该方法 |
 | 点 `.cr-model-selector__list` 里对应项 | React `onSelect` | ✅ 真实切换 |
+| **直接调下拉项的 React 回调**（`ModelItem.props.onSelect(option)`） | — | ✅ 真实切换，且不用模拟鼠标事件 |
 
 原因：官方切换完全发生在渲染层 —— 下拉项 onClick → 输入框 store `api.setModel(selection)` →
 `onChange` → 发送时 `ensureSessionModelBeforeSend` / `resolveAndSyncSessionModel` 才把模型同步进
 ACP 会话；`session:setModel` 只改了主进程里的会话记录，没有通知跑 Agent 的 ACP 连接。
-验证方式：点完看触发器 `aria-label` 是否变成 `Select model: <名称>`，以及会话 jsonl 里
-`"model"` 字段（`~/.workbuddy/projects/<cwd>/<session>.jsonl`）。
+既然发送前用的是 store 的值，那**只有写进 store 才算数**，而 store 只能由 React 回调写。
+
+> **11-15 复验结论**：位置参数形态也试过了，通道回 `{success:true}`，界面文案不变、
+> 下一条消息仍用旧模型 —— 所以「IPC 是假的」这条成立，与参数形态无关。
+> 之前怀疑的"参数错位"已被排除（`handlers.js` 里确实是 `(sessionId, modelId)`，传位置参数同样无效）。
+
+**怎么找到那个回调**（`plugins_pro/dual-model/probe.json` 实测结构）：
+
+```
+div.cr-model-selector__item        →  React props.onClick
+  ↑ fiber.return 上溯 3 层
+ModelItem                          →  memoizedProps: option / isSelected / onSelect / onToggleThinking …
+```
+
+调用顺序（每步都等界面回查，不信返回值）：
+`ModelItem.onSelect(option)` → `onSelect()` → `item.props.onClick(事件桩)` → `element.click()`。
+事件桩必须提供 `preventDefault` / `stopPropagation`，否则 onClick 内部一调就抛错。
+
+判定成功的唯一标准：`.cr-model-selector__trigger-label` 的文案变成目标模型名
+（`aria-label` 同样可用）。验证会话侧还可以看 jsonl 里的 `"model"` 字段
+（`~/.workbuddy/projects/<cwd>/<session>.jsonl`）。
 
 ### 1.2 按「每次调用」换模型：Agent 工具的 model + PreToolUse（5.9.3 实测）
 
@@ -177,6 +198,6 @@ CLI 侧 `resolveAgentModel(t)` 解析顺序：**env `CODEBUDDY_CODE_SUBAGENT_MOD
 | 加一段固定流程 | Skill |
 | 加界面/侧栏/面板 | wbpro CDP 注入 |
 | 省 token | 调压缩阈值、精简 `CODEBUDDY.md`、关掉不用的 MCP 工具 |
-| 换模型/换模式 | **必须点官方模型下拉项**（渲染层 store → 发送时同步给 ACP）；`session:setModel`/`setSessionModel` 走 IPC 是假成功 |
+| 换模型/换模式 | **调下拉项的 React 回调**（`ModelItem.props.onSelect(option)`，见 1.1）或点官方项；`session:setModel` / `setSessionModel` 走 IPC 一律假成功 |
 | 跑更久 | `CODEBUDDY_CODE_MAX_TURNS` |
 | 中途改变它的方向 | `session/steer` 或 hook `additionalContext` |

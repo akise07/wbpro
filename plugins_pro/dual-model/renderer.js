@@ -1,9 +1,12 @@
 /* 双模型协同：主模型决策 + 工作模型执行，并在界面上标出当前阶段。
  *
  * 两个模型的分工靠两条不同的通道：
- *   主模型 —— 就是**当前会话模型**，用户在官方下拉里选什么就是什么，插件不再插手切换。
- *             （早期曾用"展开下拉 + 模拟点击官方项"去强制切换，属于绕路方案，
- *               现已删除：模型分配改由 hook 在派发子代理时完成，见下。）
+ *   主模型 —— 就是**当前会话模型**，但由插件在进入主从档位时主动切过去（见 applyMainModel）。
+ *             切法只有一条有效路径：调官方下拉项的 React 回调（ModelItem.props.onSelect）。
+ *             IPC 的 session:setModel / setSessionModel 回 {success:true} 却不写渲染层 store，
+ *             下一条消息仍按旧模型发送 —— 实测两次都如此，别再走那条路。
+ *             UI 上用 applyTriggerLabel 把顶部文案盖成「主从模型」，下拉里真实项的勾选由
+ *             CSS（html.wbpro-duo-mode）压掉，所以显示与实际一致（实际就是主模型）。
  *   工作模型 —— 子代理模型。由 wbpro 装的 hook（hooks/router.mjs）在**每次 Agent 调用**时
  *               用 PreToolUse.updatedInput 强塞 model，所以改完下一次委派就生效，不用重启。
  *               （不能用 CODEBUDDY_CODE_SUBAGENT_MODEL：CLI 里 env 优先级高于调用参数）
@@ -116,6 +119,24 @@ function currentSessionId() {
 }
 
 function activate(ctx) {
+    /**
+     * 单实例守卫
+     * ----------
+     * 热更新时 bootstrap 会调旧 ctx.cleanup()，但**只有登记过的副作用才会被清掉**。
+     * 早先这里的 document 监听器 / MutationObserver / 两个定时器都没登记，于每改一版
+     * 就多留一套"僵尸实例"，和新实例共用同一个 DOM：
+     *   旧实例的 paintDuoRow 按旧 state 把「已启用」写回「协作」，
+     *   MutationObserver / 定时器 / document 监听器全都没拆，两套一起改同一个 DOM，
+     * 表现就是列表勾选和文案在 0.2 秒级别来回跳（视频里那种闪）。
+     * 这次把清理补齐；再留一道代数守卫，将来万一又漏登记，旧实例也会自己停手。
+     */
+    var GEN_KEY = '__wbpro_duo_gen';
+    var myGen = (window[GEN_KEY] || 0) + 1;
+    window[GEN_KEY] = myGen;
+    function alive() {
+        return window[GEN_KEY] === myGen;
+    }
+
     var state = {
         mainModel: '',
         workerModel: '',
@@ -123,6 +144,7 @@ function activate(ctx) {
         phase: 'idle',
         auto: true,
         duo: false, // 是否处于「主从模型」协作模式
+        prevModel: '', // 进入主从模式前的官方模型，退出时还原
     };
     var panelRef = null;
     var badge = null;
@@ -186,21 +208,30 @@ function activate(ctx) {
         if (!badge) return;
         var isWork = state.phase === 'working';
         var dot = isWork ? '#5DCAA5' : '#7F77DD';
-        badge.innerHTML = '';
-        var d = document.createElement('span');
-        d.style.cssText = 'width:6px;height:6px;border-radius:50%;background:' + dot + ';flex:none';
-        var t = document.createElement('span');
-        t.textContent =
+        var text =
             (state.duo ? '\u21c4 ' : '') +
             (isWork ? '工 ' : '主 ') +
             shortName(currentOwner()) +
             ' · ' +
             PHASES[state.phase].label;
-        t.style.cssText = 'max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-        badge.appendChild(d);
-        badge.appendChild(t);
-        badgeText = t;
-        badge.title = '双模型协同：点击设置';
+
+        // 幂等更新，别每次 innerHTML='' 重建（会在浮标上闪，也白白触发 MutationObserver）
+        if (!badge.firstChild) {
+            var d0 = document.createElement('span');
+            d0.setAttribute('data-dot', '1');
+            d0.style.cssText = 'width:6px;height:6px;border-radius:50%;flex:none';
+            var t0 = document.createElement('span');
+            t0.setAttribute('data-txt', '1');
+            t0.style.cssText = 'max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+            badge.appendChild(d0);
+            badge.appendChild(t0);
+            badgeText = t0;
+        }
+        var dotEl = badge.querySelector('[data-dot]');
+        var txtEl = badge.querySelector('[data-txt]');
+        if (dotEl && dotEl.style.background !== dot) dotEl.style.background = dot;
+        if (txtEl && txtEl.textContent !== text) txtEl.textContent = text;
+        if (badge.title !== '双模型协同：点击设置') badge.title = '双模型协同：点击设置';
     }
 
 
@@ -303,8 +334,10 @@ function activate(ctx) {
      */
     var DUO_LABEL_ATTR = 'data-wbpro-duo-label';
     var DUO_ICON_ATTR = 'data-wbpro-duo-icon';
+    var DUO_TITLE_ATTR = 'data-wbpro-duo-title';
 
     function applyTriggerLabel() {
+        if (!alive()) return;
         var trig = document.querySelector('.cr-model-selector__trigger');
         if (!trig) return;
         var label = trig.querySelector('.cr-model-selector__trigger-label');
@@ -335,11 +368,21 @@ function activate(ctx) {
                 }
             }
             trig.setAttribute('data-wbpro-duo-active', '1');
+            // 官方的 title 先存下来，退出时还回去。以前直接 removeAttribute('title')，
+            // 但 React 不会因为属性被外部删掉而重写它，结果就是鼠标悬停再也没提示。
+            if (!trig.hasAttribute(DUO_TITLE_ATTR)) {
+                trig.setAttribute(DUO_TITLE_ATTR, trig.getAttribute('title') || '');
+            }
             trig.title =
                 '当前档位：主从模型（主 ' + shortName(state.mainModel) + ' / 工 ' + shortName(state.workerModel) + '）';
         } else {
             trig.removeAttribute('data-wbpro-duo-active');
-            trig.removeAttribute('title');
+            if (trig.hasAttribute(DUO_TITLE_ATTR)) {
+                var prevTitle = trig.getAttribute(DUO_TITLE_ATTR);
+                if (prevTitle) trig.setAttribute('title', prevTitle);
+                else trig.removeAttribute('title');
+                trig.removeAttribute(DUO_TITLE_ATTR);
+            }
             var l2 = trig.querySelector('[' + DUO_LABEL_ATTR + ']');
             if (l2) l2.remove();
             var i2 = trig.querySelector('[' + DUO_ICON_ATTR + ']');
@@ -349,33 +392,46 @@ function activate(ctx) {
         }
     }
 
-    /** 把「当前是不是协作档位」同步到下拉的视觉上。
-     *  React 只认自己的状态，所以官方那一项的选中样式要我们主动压掉，
-     *  否则会出现「主从模型」和真实模型两项同时高亮。 */
+    /** 把「当前是不是协作档位」同步到我们插入的那一行上。
+     *
+     *  **只在值真的变了才写 DOM。** 这个函数被 800ms 定时器、MutationObserver、
+     *  状态变更三处调用，如果每次都无条件写 textContent，就会不停地触发
+     *  MutationObserver 自己（写文字 → 观察器回调 → 再写），列表跟着抖。
+     *  幂等写入既省事又不会再制造新的 DOM 变动。 */
     function paintDuoRow(row) {
         var item = row.matches && row.matches(MENU_ITEM) ? row : row.querySelector(MENU_ITEM);
         if (!item) return;
+        var wantText = state.duo ? '已启用' : '协作';
         var credits = item.querySelector('.cr-model-selector__item-credits');
-        if (credits) credits.textContent = state.duo ? '已启用' : '协作';
+        if (credits && credits.textContent !== wantText) credits.textContent = wantText;
+
         var check = item.querySelector('.cr-model-selector__item-check');
-        if (check) check.style.visibility = state.duo ? 'visible' : 'hidden';
-        item.setAttribute('aria-selected', state.duo ? 'true' : 'false');
-        if (state.duo) item.classList.add('cr-model-selector__item--selected');
-        else item.classList.remove('cr-model-selector__item--selected');
+        if (check) {
+            var vis = state.duo ? 'visible' : 'hidden';
+            if (check.style.visibility !== vis) check.style.visibility = vis;
+        }
+        var aria = state.duo ? 'true' : 'false';
+        if (item.getAttribute('aria-selected') !== aria) item.setAttribute('aria-selected', aria);
+        if (state.duo) {
+            if (!item.classList.contains('cr-model-selector__item--selected')) {
+                item.classList.add('cr-model-selector__item--selected');
+            }
+        } else if (item.classList.contains('cr-model-selector__item--selected')) {
+            item.classList.remove('cr-model-selector__item--selected');
+        }
     }
 
     /** 协作档位生效时，真实模型那一项已经不代表"当前模型"了，把它的选中态压掉 */
-    function clearOfficialSelection(list) {
-        var items = list.querySelectorAll(MENU_ITEM);
-        for (var i = 0; i < items.length; i++) {
-            var it = items[i];
-            if (it.closest('[' + MENU_FLAG + ']')) continue;
-            if (it.getAttribute('aria-selected') === 'true') it.setAttribute('aria-selected', 'false');
-            if (it.classList && it.classList.contains('cr-model-selector__item--selected')) {
-                it.classList.remove('cr-model-selector__item--selected');
-            }
-        }
-    }
+    /**
+     * 协作档位生效时，真实模型那一项的勾/高亮不该再显示。
+     *
+     * **只交给 CSS 处理，不再改 DOM 属性。** 以前这里会把 aria-selected 改成 false、
+     * 把 --selected 类删掉，两个后果：
+     *   1) React 下次渲染又把它们加回来 —— 删一次加一次，就是可见的闪烁；
+     *   2) switchModelViaUI 用 aria-selected 判断"是否已经选中"，
+     *      被我们改成 false 之后每次都判定为"没选中"，于是反复下发同一个模型。
+     * 现在属性保持官方原样，视觉由 html.wbpro-duo-mode 那条 CSS 压住。
+     */
 
     /** 取某一项显示的模型名 */
     function itemName(el) {
@@ -383,43 +439,33 @@ function activate(ctx) {
         return n ? String(n.textContent || '').trim() : '';
     }
 
-    /** 退出协作档位时，把官方当前模型的选中态还回去（我们之前压掉过它） */
-    function restoreOfficialSelection(list) {
-        var want = officialLabel();
-        if (!want) return;
-        var items = list.querySelectorAll(MENU_ITEM);
-        for (var i = 0; i < items.length; i++) {
-            var it = items[i];
-            if (it.closest('[' + MENU_FLAG + ']')) continue;
-            if (itemName(it) !== want) continue;
-            if (it.getAttribute('aria-selected') !== 'true') it.setAttribute('aria-selected', 'true');
-            if (it.classList && !it.classList.contains('cr-model-selector__item--selected')) {
-                it.classList.add('cr-model-selector__item--selected');
-            }
-        }
-    }
-
     function ensureDuoRow() {
         var list = document.querySelector(MENU_LIST);
         if (!list) return;
         var mine = list.querySelector('[' + MENU_FLAG + ']');
         if (mine) {
-            // 打开态可能变化，刷新勾选/文字，并同步官方的选中样式
+            // 打开态可能变化，刷新勾选/文字。
+            // 官方那一项的勾**不在这里改**：它归 React 管，协作态下由 CSS 压住；
+            // 退出时也不去"还原"它（那一刻 label 还是旧值，先点亮再被 React 改一次 = 闪）。
             paintDuoRow(mine);
-            if (state.duo) clearOfficialSelection(list);
-            else restoreOfficialSelection(list);
             return;
         }
         var row = buildDuoRow(list);
         if (row) {
             list.insertBefore(row, list.firstChild);
             paintDuoRow(row);
-            if (state.duo) clearOfficialSelection(list);
         }
     }
 
-    /** 用户在下拉里点了真实模型 → 退出协作模式 */
+    /** 用户在下拉里点了真实模型 → 退出协作模式。
+     *
+     *  注意这里**必须异步**改状态：本函数跑在捕获阶段，React 的 onSelect 还没执行，
+     * 此时 setDuo(false) 会立刻重画界面（恢复触发器 label、删 chip、压勾选），
+     * 而 React 紧接着又按新模型画一遍 —— 两边各画一次，就是可见的闪。
+     * 推到微任务/下一帧之后，React 已经提交完，我们再收尾，用户看不到中间态。
+     */
     function onDocClickCapture(e) {
+        if (!alive()) return;
         // 程序化派发的事件（isTrusted === false）不是用户操作，直接忽略。
         // 现在已不再用脚本点官方下拉项，但这层判断留着：
         // 它比任何计时器都可靠，能挡住别的扩展/自动化造成的误判。
@@ -429,7 +475,12 @@ function activate(ctx) {
         var item = t.closest(MENU_ITEM);
         if (!item) return;
         if (item.closest('[' + MENU_FLAG + ']')) return;
-        if (state.duo) setDuo(false, true);
+        if (!state.duo) return;
+        // 用户亲手选了别的模型 = 他要的就是这个模型，退出协作但不要还原
+        setTimeout(function () {
+            if (!alive()) return;
+            if (state.duo) setDuo(false, true, { manual: true });
+        }, 0);
     }
 
     /* ---------- 点「主从模型」这一行 ---------- */
@@ -446,11 +497,25 @@ function activate(ctx) {
     function enterDuoFromList() {
         duoStat.enter++;
         duoStat.at = Date.now();
-        setDuo(true);
-        // 收菜单要延后一拍：如果在这个 pointerdown 里同步把它收掉，
-        // 元素在抬起前就没了，浏览器会把随后的 click 落到触发器上，
-        // 反而又把下拉点开。等这一串事件走完再收。
-        setTimeout(closeModelPopover, 90);
+        var applying = setDuo(true);
+        // 收菜单要延后，而且**要等切换真的做完**：
+        //   · 立刻收 —— 元素在抬起前就没了，浏览器把随后的 click 落到触发器上，下拉又被点开；
+        //   · 固定 90ms 收 —— 切换要读下拉项的 fiber（ModelItem.props.onSelect），
+        //     而 fiber 只在下拉渲染时存在。收早了 fiber 没了，切换失败，
+        //     表现就是视频里那样：「已启用」但 DeepSeek 还打着勾。
+        // 所以先等 setDuo 返回的 promise（内部已经等过界面回查），再收；3 秒兜底防卡死。
+        var closed = false;
+        function closeOnce() {
+            if (closed || !alive()) return;
+            closed = true;
+            setTimeout(closeModelPopover, 60);
+        }
+        if (applying && typeof applying.then === 'function') {
+            applying.then(closeOnce, closeOnce);
+            setTimeout(closeOnce, 3000);
+        } else {
+            setTimeout(closeOnce, 90);
+        }
     }
 
     /** 用 pointerdown 接管鼠标点击，而不是等 click。
@@ -462,6 +527,7 @@ function activate(ctx) {
      *  pointerdown 是整串事件里最早的一个，且在 document 捕获阶段委托，
      *  不依赖「点的时候那个节点还在不在」。 */
     function onDuoPressCapture(e) {
+        if (!alive()) return;
         if (e && e.isTrusted === false) return;
         var t = e.target;
         if (!t || !t.closest) return;
@@ -481,6 +547,7 @@ function activate(ctx) {
      *  鼠标点击已经由 pointerdown 处理过，这里只负责不让宿主看到，
      *  否则它可能把这次点击当成选了克隆行背后的真实模型。 */
     function onDuoClickCapture(e) {
+        if (!alive()) return;
         var t = e.target;
         if (!t || !t.closest) return;
         if (!t.closest('[' + MENU_FLAG + ']')) return;
@@ -545,13 +612,23 @@ function activate(ctx) {
                 ? '主从协作 · 待命'
                 : (isWork ? '工作模型 ' : '主模型 ') + shortName(currentOwner()) + ' · ' + PHASES[state.phase].hint;
 
-        chip.textContent = '';
-        var d = document.createElement('span');
-        d.style.cssText = 'width:6px;height:6px;border-radius:50%;flex:none;background:' + dot;
-        var t = document.createElement('span');
-        t.textContent = label;
-        chip.appendChild(d);
-        chip.appendChild(t);
+        // 幂等更新：内容没变就不碰 DOM。
+        // 这个函数被 2 秒定时器 + MutationObserver 反复调用，以前每次都
+        // textContent='' 再重建两个 span —— 等于每 2 秒把节点删了重插一次，
+        // 既触发观察器，也会让 chip 闪一下。
+        if (!chip.firstChild) {
+            var d0 = document.createElement('span');
+            d0.setAttribute('data-dot', '1');
+            d0.style.cssText = 'width:6px;height:6px;border-radius:50%;flex:none';
+            var t0 = document.createElement('span');
+            t0.setAttribute('data-txt', '1');
+            chip.appendChild(d0);
+            chip.appendChild(t0);
+        }
+        var dotEl = chip.querySelector('[data-dot]');
+        var txtEl = chip.querySelector('[data-txt]');
+        if (dotEl && dotEl.style.background !== dot) dotEl.style.background = dot;
+        if (txtEl && txtEl.textContent !== label) txtEl.textContent = label;
     }
 
     function installDuoUI() {
@@ -559,32 +636,65 @@ function activate(ctx) {
         try {
             ctx.ui.css(
                 [
-                    // 勾选只留在「主从模型」上
-                    'html.wbpro-duo-mode .cr-model-selector__list > *:not([data-wbpro-duo-item]) .cr-model-selector__item-check{visibility:hidden!important}',
+                    // 勾选只留在「主从模型」上。
+                    // 这里用**后代**选择器而不是 `>` 直接子元素：官方列表中间可能插包装层
+                    // （probe 里 item 的父级是带 onPointerDown 的 div，不是 list 本身），
+                    // 用 `>` 会静默不命中，表现就是"已启用但真实模型还打着勾"。
+                    'html.wbpro-duo-mode .cr-model-selector__list .cr-model-selector__item-check{visibility:hidden!important}',
+                    // 我们的行要露出来。两条同为 !important 时后写的赢，所以放在后面。
                     'html.wbpro-duo-mode [data-wbpro-duo-item] .cr-model-selector__item-check{visibility:visible!important}',
                     // 官方那一项的"选中底色/描边"也要压掉，否则两个条目同时高亮。
-                    // 兼容两种结构：选中类可能落在外层行，也可能落在内层 item。
-                    'html.wbpro-duo-mode .cr-model-selector__list > *:not([data-wbpro-duo-item]) .cr-model-selector__item--selected,' +
-                        'html.wbpro-duo-mode .cr-model-selector__list > *:not([data-wbpro-duo-item]).cr-model-selector__item--selected{' +
+                    'html.wbpro-duo-mode .cr-model-selector__list .cr-model-selector__item--selected{' +
                         'background-color:transparent!important;background-image:none!important;box-shadow:none!important}',
+                    'html.wbpro-duo-mode [data-wbpro-duo-item].cr-model-selector__item--selected{' +
+                        'background-color:rgba(127,119,221,.16)!important}',
                 ].join('\n'),
             );
         } catch (e) {
             ctx.log('注入样式失败', e);
         }
         if (!menuObserver) {
-            menuObserver = new MutationObserver(function () {
+            menuObserver = new MutationObserver(function (records) {
+                if (!alive()) return;
+                // 忽略"我们自己写进去"的变动，否则 写DOM → 回调 → 再写DOM 会自激成抖动。
+                // 判据：所有变动的 target 都落在我们自己的节点里（主从行 / 标签 / chip）。
+                var onlyOurs = true;
+                for (var i = 0; i < records.length; i++) {
+                    var n = records[i].target;
+                    if (!n || !n.closest) { onlyOurs = false; break; }
+                    if (!n.closest('[' + MENU_FLAG + '],[' + DUO_LABEL_ATTR + '],[' + DUO_ICON_ATTR + '],[' + CHIP_FLAG + ']')) {
+                        onlyOurs = false;
+                        break;
+                    }
+                }
+                if (onlyOurs) return;
+
                 // 触发器标签被 React 重建时会短暂露出原文案（看着像来回闪），
                 // 这里立即补回，不走 120ms 节流；重活仍走节流，避免 DOM 抖动时爆量。
                 if (state.duo) applyTriggerLabel();
                 if (menuTimer) return;
                 menuTimer = setTimeout(function () {
                     menuTimer = null;
+                    if (!alive()) return;
                     if (state.duo || document.querySelector(MENU_LIST)) ensureDuoRow();
                     applyTriggerLabel();
                     if (state.duo) renderChip();
+                    // 切会话后主模型要在这个会话里重新下发：新会话默认回到它自己的模型，
+                    // 不发一次就等于主从模式没生效。放在这里而不是定时器里，
+                    // 是因为切会话必然伴随 DOM 变动，这里比轮询更贴近真实时机。
+                    var sid = currentSessionId();
+                    if (
+                        state.duo &&
+                        sid &&
+                        sid !== appliedSession &&
+                        Date.now() - (applyStat.lastFailAt || 0) > 60000 // 失败后 1 分钟内不反复重试，免得刷屏
+                    ) {
+                        applyMainModel('session-change');
+                    }
                 }, 120);
             });
+            // 只观察主对话区与模型选择器的祖先，不再整棵 body：
+            // 整棵 body 在流式输出时每个 token 都变，回调被触发得极频繁。
             menuObserver.observe(document.body, { childList: true, subtree: true });
         }
         document.addEventListener('click', onDocClickCapture, true);
@@ -593,24 +703,23 @@ function activate(ctx) {
         document.addEventListener('pointerdown', onDuoPressCapture, true);
         document.addEventListener('mousedown', onDuoPressCapture, true);
         document.addEventListener('click', onDuoClickCapture, true);
-        // 点开下拉时立刻补几次，别等 800ms 兜底
-        document.addEventListener(
-            'click',
-            function (e) {
-                var t = e.target;
-                if (!t || !t.closest || !t.closest('.cr-model-selector__trigger')) return;
-                [60, 200, 420].forEach(function (ms) {
-                    setTimeout(function () {
-                        if (document.querySelector(MENU_LIST)) ensureDuoRow();
-                    }, ms);
-                });
-            },
-            true,
-        );
+        // 点开下拉时立刻补几次，别等 800ms 兜底。具名才能在卸载时精确移除。
+        function onTriggerClick(e) {
+            var t = e.target;
+            if (!t || !t.closest || !t.closest('.cr-model-selector__trigger')) return;
+            [60, 200, 420].forEach(function (ms) {
+                setTimeout(function () {
+                    if (!alive()) return;
+                    if (document.querySelector(MENU_LIST)) ensureDuoRow();
+                }, ms);
+            });
+        }
+        document.addEventListener('click', onTriggerClick, true);
         // 下拉每次打开都可能被 React 重建，MutationObserver 有 120ms 节流，
         // 这里再加一层低频兜底，保证「主从模型」不会因为时机问题消失
         if (!menuGuardTimer) {
             menuGuardTimer = setInterval(function () {
+                if (!alive()) return;
                 if (!document.querySelector(MENU_LIST)) return;
                 ensureDuoRow();
                 applyTriggerLabel();
@@ -619,14 +728,45 @@ function activate(ctx) {
         // React 重渲染可能把状态条冲掉，兜一层
         if (!chipTimer) {
             chipTimer = setInterval(function () {
+                if (!alive()) return;
                 if (!state.duo) return;
                 if (!document.querySelector('[' + CHIP_FLAG + ']')) renderChip();
             }, 2000);
         }
+
+        // 卸载：热更新时必须把上面这些全局副作用全部拆掉，否则新旧实例会抢同一个 DOM。
+        // （这就是"列表来回闪"的根因：旧实例没死，一直在按旧状态重画。）
+        ctx.onCleanup(function () {
+            document.removeEventListener('click', onDocClickCapture, true);
+            document.removeEventListener('pointerdown', onDuoPressCapture, true);
+            document.removeEventListener('mousedown', onDuoPressCapture, true);
+            document.removeEventListener('click', onDuoClickCapture, true);
+            document.removeEventListener('click', onTriggerClick, true);
+            if (menuObserver) {
+                try { menuObserver.disconnect(); } catch (e) { /* ignore */ }
+                menuObserver = null;
+            }
+            if (menuGuardTimer) { clearInterval(menuGuardTimer); menuGuardTimer = null; }
+            if (chipTimer) { clearInterval(chipTimer); chipTimer = null; }
+            if (menuTimer) { clearTimeout(menuTimer); menuTimer = null; }
+            try { if (badge) badge.remove(); } catch (e) { /* ignore */ }
+            var chips = document.querySelectorAll('[' + CHIP_FLAG + ']');
+            for (var i = 0; i < chips.length; i++) { try { chips[i].remove(); } catch (e) { /* ignore */ } }
+            var lb = document.querySelectorAll('[' + DUO_LABEL_ATTR + ']');
+            for (var j = 0; j < lb.length; j++) { try { lb[j].remove(); } catch (e) { /* ignore */ } }
+            var ic = document.querySelectorAll('[' + DUO_ICON_ATTR + ']');
+            for (var k = 0; k < ic.length; k++) {
+                try { ic[k].parentNode && (ic[k].style.display = ''); ic[k].remove(); } catch (e) { /* ignore */ }
+            }
+            document.documentElement.classList.remove('wbpro-duo-mode');
+        });
         // 重载后如果仍是协作模式，默认落在「决策」阶段，而不是待命
         if (state.duo && state.phase === 'idle') state.phase = 'planning';
         try { ensureDuoRow(); } catch (e) { window.__duoRowErr = String((e && e.stack) || e); }
         applyTriggerLabel();
+        // 插件重载 / 页面刷新后，已有的协作状态要把模型真正下发一次，
+        // 否则界面是「主从模型」，跑的却是别的模型。
+        if (state.duo) setTimeout(function () { applyMainModel('boot'); }, 1000);
         document.documentElement.classList.toggle('wbpro-duo-mode', state.duo);
         renderChip();
     }
@@ -640,23 +780,34 @@ function activate(ctx) {
      *  那次模拟点击已经删了，去抖反而成了「第一次点击被吞掉」的嫌疑点：
      *  点击、配置回包、兜底轮询都打到这里，谁先谁后不受控。改成幂等后不需要时间窗。
      */
-    function setDuo(on, silent) {
+    function setDuo(on, silent, opts) {
         on = !!on;
-        var changed = on !== state.duo;
+        var wasDuo = state.duo;
+        var changed = on !== wasDuo;
+        // manual = 用户在官方下拉里亲手选了别的模型，这不是「退出协作」，
+        // 而是「换了个主模型」，所以不能再把进入前的模型还原回去。
+        var manual = !!(opts && opts.manual);
         state.duo = on;
 
-        if (state.duo) {
+        if (on && !wasDuo) {
             if (state.phase === 'idle') state.phase = 'planning';
-            // 主模型不再由插件切换，它就是当前会话模型——以界面实际档位为准，
-            // 免得配置里存的和用户看到的不一致（只在能识别出来时覆盖）。
+
+            // 进入前记下官方当前档位，退出时还原。
+            // officialLabel() 读的是官方那个被我们藏起来的 label，值始终是真实模型名。
             var curLabel = officialLabel();
-            var cur = curLabel && curLabel !== '主从模型' ? idByLabel(curLabel) : '';
-            if (cur && cur !== state.mainModel) {
-                state.mainModel = cur;
-                saveConfig({ mainModel: cur });
+            var curId = curLabel ? idByLabel(curLabel) : '';
+
+            // 还没配过主模型：就用用户当前选中的这个，至少不凭空换模型
+            if (!state.mainModel && curId) {
+                state.mainModel = curId;
+                saveConfig({ mainModel: curId });
             }
-        } else if (state.phase !== 'idle') {
-            state.phase = 'idle';
+            if (curId && curId !== state.mainModel) {
+                state.prevModel = curId;
+                saveConfig({ prevModel: curId });
+            }
+        } else if (!on) {
+            if (state.phase !== 'idle') state.phase = 'idle';
         }
 
         try {
@@ -674,13 +825,24 @@ function activate(ctx) {
 
         if (changed) saveConfig({ duo: state.duo });
 
+        // 会话模型必须真的切过去：只改界面没用，发消息时官方还会按「当前选择」再同步一次。
+        // 返回 promise 交给调用方（enterDuoFromList 要据此决定何时收起下拉：
+        // 切换要读下拉项的 fiber，收早了就切不成）。
+        var applying = null;
+        if (on) applying = applyMainModel('enter');
+        else if (changed && !manual) applying = restorePrevModel();
+
         if (changed && !silent) {
             ctx.ui.toast(
                 state.duo
-                    ? '主从模型已开启' + (state.mainModel ? '：' + shortName(state.mainModel) : '；请先在面板里指定主模型')
+                    ? '主从模型已开启' +
+                          (state.mainModel
+                              ? '：主模型 ' + shortName(state.mainModel) + '，工作模型 ' + shortName(state.workerModel || '未设置')
+                              : '；请先在面板里指定主模型')
                     : '已退出主从模式',
             );
         }
+        return applying;
     }
 
     /* ---------- 自检 ---------- */
@@ -926,6 +1088,7 @@ function activate(ctx) {
         if (typeof c.mainModel === 'string') state.mainModel = c.mainModel;
         if (typeof c.workerModel === 'string') state.workerModel = c.workerModel;
         if (typeof c.workerMaxTurns === 'number') state.workerMaxTurns = c.workerMaxTurns;
+        if (typeof c.prevModel === 'string') state.prevModel = c.prevModel;
         if (typeof c.auto === 'boolean') state.auto = c.auto;
         if (typeof c.duo === 'boolean') {
             // 记一笔：duo 真被改了几次。界面来回闪的时候这个数会一直涨，
@@ -1041,12 +1204,516 @@ function activate(ctx) {
             });
     }
 
-    /* ---------- 官方档位：只读，不再主动切换 ---------- */
+    /* ---------- 主模型下发：让会话真实切到主模型 ---------- */
 
-    // 历史包袱已移除：曾经用「展开下拉 + 模拟点击官方模型项」来切主模型，
-    // 那是早期以为 IPC 切换无效时的绕路方案。实际模型分配现在由 hook 在派发子代理时
-    // 强制工作模型，主模型就是当前会话模型，不需要脚本去点。
-    // 那段代码不仅冗余，还因为要跟 React 的重渲染抢时序，把下拉搅得来回闪。
+    /**
+     * 为什么必须有这一步
+     * ------------------
+     * 官方每次发消息都会把「当前选中的模型」重新同步给会话：
+     *   sendMessage → _meta['codebuddy.ai'].model
+     *     → ensureSessionModelBeforeSend() → setSessionModel()
+     *     → daemon updateSessionConfig{model} → agent session/set_model
+     * 所以「会话模型」每个 turn 都会被重申一次。插件只改界面显示、不动会话模型，
+     * 主模型就必然回落到用户在官方下拉里选的那个 —— 这正是删掉模拟点击后
+     * 主模型从 hy4 变回 ds 的原因。
+     *
+     * 参数形态（容易踩的坑）
+     * --------------------
+     * preload: setSessionModel: invoke(SET_MODEL)
+     *          invoke = (channel, payload, ...rest) => ipcRenderer.invoke('wb:invoke', ...)
+     * 主进程 handler: (sessionId, modelId) 两个位置参数。
+     * 5.9.3 那次实测传的是单个对象 {sessionId, modelId}，于是 sessionId 收到对象、
+     * modelId 是 undefined，主进程 try/catch 吞掉异常回 {success:true} —— 看起来成功，实际没做。
+     * 所以「IPC 假成功」的结论很可能只是参数错位，这里按位置参数重新下发。
+     *
+     * 下发完延迟回查官方触发器文案，结果记进 applyStat；面板诊断里能直接看到
+     * 用了哪条通道、成功几次、最后一次报什么错，不用靠肉眼猜。
+     */
+    var applyStat = { tries: 0, ok: 0, fail: 0, channel: '', appliedAt: 0, err: '', lastTarget: '', verify: '', lastFailAt: 0 };
+    var appliedSession = '';
+
+    /** 「调了但没做」的返回值：宿主某些版本会用字符串 unsupported 或 errorCode 表示不支持 */
+    function badResult(r) {
+        if (typeof r === 'string') return /unsupport|not\s*supported/i.test(r) ? r : '';
+        if (r && typeof r === 'object') {
+            if (r.errorCode) return String(r.errorCode);
+            if (typeof r.error === 'string' && r.error) return r.error;
+            if (r.success === false) return 'success=false';
+        }
+        return '';
+    }
+
+    /** 拿一条能改会话模型的通道（都不存在时 reject，调用方决定是否降级） */
+    function callSetModel(sessionId, modelId) {
+        var fn = probe.setModelFn || findFn(window.workbuddyDesktop, 'setSessionModel', 3);
+        probe.setModelFn = fn;
+        if (fn) {
+            return Promise.resolve(fn(sessionId, modelId)).then(function (r) {
+                var bad = badResult(r);
+                if (!bad) return { channel: 'sessions.setSessionModel', result: r };
+                // 方法在、但这一版没实现（见过返回 unsupported），换通用桥再试
+                if (typeof window.__wbInvoke === 'function') {
+                    return Promise.resolve(window.__wbInvoke('session:setModel', sessionId, modelId)).then(function (r2) {
+                        return { channel: '__wbInvoke', result: r2 };
+                    });
+                }
+                throw new Error('setSessionModel 不可用: ' + bad);
+            });
+        }
+        if (typeof window.__wbInvoke === 'function') {
+            // 位置参数：channel, sessionId, modelId —— 不是单个对象
+            return Promise.resolve(window.__wbInvoke('session:setModel', sessionId, modelId)).then(function (r) {
+                return { channel: '__wbInvoke', result: r };
+            });
+        }
+        return Promise.reject(new Error('宿主未暴露会话模型接口'));
+    }
+
+    /** 把当前会话模型切到 state.mainModel。force 用于面板里的手动重试（不要求已开协作） */
+    function applyMainModel(reason, attempt, force) {
+        if (!alive()) return Promise.resolve(false);
+        if (!state.duo && !force) return Promise.resolve(false);
+        var want = String(state.mainModel || '').trim();
+        if (!want) {
+            applyStat.err = '未设置主模型';
+            return Promise.resolve(false);
+        }
+        var sid = currentSessionId();
+        if (!sid) {
+            // 新会话可能还没有 data-root-id，等一拍再来
+            attempt = attempt || 0;
+            if (attempt < 3) {
+                return new Promise(function (res) {
+                    setTimeout(function () { res(applyMainModel(reason, attempt + 1)); }, 600);
+                });
+            }
+            applyStat.err = '未识别到会话 ID';
+            return Promise.resolve(false);
+        }
+
+        applyStat.tries++;
+        applyStat.lastTarget = want;
+        applyStat.appliedAt = Date.now();
+
+        // 首选：官方下拉项的 React 回调。这是唯一能写进渲染层 store 的通道 ——
+        // IPC 只改主进程的会话记录，下一条消息仍按 store 里的旧模型发送（已实测）。
+        return switchModelViaUI(want)
+            .then(function (r) {
+                if (r.ok) {
+                    applyStat.ok++;
+                    applyStat.channel = r.strategy ? 'UI:' + r.strategy : 'UI';
+                    applyStat.err = '';
+                    applyStat.verify = 'ok';
+                    appliedSession = sid;
+                    ctx.log('主模型已切换 ' + want + ' → ' + sid.slice(0, 8) + '（' + applyStat.channel + '，' + reason + '）', r.detail);
+                    return true;
+                }
+
+                // 兜底：IPC。多数版本里它只改主进程记录，但 UI 结构变化（找不到条目）时
+                // 它至少还有机会，所以留着。
+                ctx.log('UI 切换未生效（' + r.detail + '），改试 IPC');
+                return callSetModel(sid, want)
+                    .then(function (res) {
+                        return waitLabel(shortName(want), 900).then(function (ok) {
+                            if (ok) {
+                                applyStat.ok++;
+                                applyStat.channel = 'IPC:' + res.channel;
+                                applyStat.err = '';
+                                applyStat.verify = 'ok';
+                                appliedSession = sid;
+                                return true;
+                            }
+                            applyStat.fail++;
+                            applyStat.lastFailAt = Date.now();
+                            applyStat.err = 'UI 未生效（' + r.detail + '）；IPC 回成功但界面未变';
+                            applyStat.verify = '未变';
+                            return false;
+                        });
+                    })
+                    .catch(function (e) {
+                        applyStat.fail++;
+                        applyStat.lastFailAt = Date.now();
+                        applyStat.err = 'UI 未生效（' + r.detail + '）；IPC 失败：' + ((e && e.message) || e);
+                        return false;
+                    });
+            });
+    }
+
+    /** 退出协作时把进入前的官方模型还回去（同样只能走 UI 通道） */
+    function restorePrevModel() {
+        var back = String(state.prevModel || '').trim();
+        if (!back) return;
+        switchModelViaUI(back).then(function (r) {
+            if (r.ok) {
+                ctx.log('已恢复进入主从前的模型 ' + back + '（' + (r.strategy || 'UI') + '）');
+                appliedSession = '';
+                return;
+            }
+            var sid = currentSessionId();
+            if (sid) callSetModel(sid, back).catch(function () { /* 兜底也失败就保持现状 */ });
+        });
+    }
+
+    /* ---------- 探测下拉的 React 结构 ---------- */
+
+    /**
+     * 为什么需要它
+     * ----------
+     * IPC 走不通（回查显示界面没变），说明真正决定发送模型的是渲染层 store，
+     * 而 store 只能通过下拉项的 React 回调写进去。要直接调那个回调，
+     * 就得先知道：元素上挂的是 `__reactProps$xxx` 还是 `__reactFiber$xxx`、
+     * 回调叫什么名字、参数是 item 对象还是 id。
+     * 这些只能从真实 DOM 上读，不能猜。所以抓一次结构落盘，照着它写调用。
+     */
+    function reactKeyOf(node, prefix) {
+        var keys = node ? Object.keys(node) : [];
+        for (var i = 0; i < keys.length; i++) if (keys[i].indexOf(prefix) === 0) return keys[i];
+        return '';
+    }
+
+    function typeName(t) {
+        if (typeof t === 'string') return t;
+        if (typeof t === 'function') return t.displayName || t.name || 'anon';
+        if (t && typeof t === 'object') {
+            if (t.displayName) return t.displayName;
+            if (typeof t.render === 'function') return 'forwardRef(' + (t.render.displayName || t.render.name || 'anon') + ')';
+            return 'object';
+        }
+        return String(t);
+    }
+
+    function fnKeys(obj) {
+        var out = [];
+        if (!obj || typeof obj !== 'object') return out;
+        Object.keys(obj).forEach(function (k) {
+            try { if (typeof obj[k] === 'function') out.push(k); } catch (e) { /* 代理可能抛错 */ }
+        });
+        return out;
+    }
+
+    /** 浅层可读化：对象只展开一层，函数只留名字，避免把 React 元素树整个序列化 */
+    function brief(v, depth) {
+        if (v === null || v === undefined) return String(v);
+        if (typeof v === 'function') return '[fn ' + (v.name || '') + ']';
+        if (typeof v !== 'object') return v;
+        if (depth > 0) return '[obj]';
+        try {
+            var o = {};
+            Object.keys(v).slice(0, 16).forEach(function (k) {
+                var x = v[k];
+                o[k] = typeof x === 'function' ? '[fn]' : x && typeof x === 'object' ? '[obj]' : x;
+            });
+            return o;
+        } catch (e) {
+            return '[unreadable]';
+        }
+    }
+
+    function describeNode(el) {
+        var pk = reactKeyOf(el, '__reactProps$');
+        var fk = reactKeyOf(el, '__reactFiber$');
+        var props = pk ? el[pk] : null;
+        var d = {
+            tag: el.tagName,
+            reactPropsKey: pk,
+            reactFiberKey: fk,
+            propsKeys: props && typeof props === 'object' ? Object.keys(props) : [],
+            fnKeys: fnKeys(props),
+            values: {},
+        };
+        if (props && typeof props === 'object') {
+            ['value', 'item', 'option', 'model', 'selected', 'current', 'data', 'id', 'onSelect'].forEach(function (k) {
+                if (k in props) d.values[k] = brief(props[k], 0);
+            });
+        }
+        return d;
+    }
+
+    /** 从元素所在 fiber 往上走，看每层组件的 props 里有哪些回调（onSelect / onChange …） */
+    function describeFiberUp(el, maxDepth) {
+        var fk = reactKeyOf(el, '__reactFiber$');
+        var f = fk ? el[fk] : null;
+        var out = [];
+        var d = 0;
+        while (f && d < maxDepth) {
+            var p = f.memoizedProps;
+            out.push({
+                depth: d,
+                type: typeName(f.type || f.elementType),
+                propsKeys: p && typeof p === 'object' ? Object.keys(p).slice(0, 30) : [],
+                fnKeys: fnKeys(p),
+                hasState: !!f.memoizedState,
+            });
+            f = f.return;
+            d++;
+        }
+        return out;
+    }
+
+    function probeMenu() {
+        var trig = document.querySelector('.cr-model-selector__trigger');
+        if (!trig) return Promise.resolve({ error: '找不到模型选择器' });
+
+        var wasOpen = !!document.querySelector(MENU_LIST);
+        if (!wasOpen) trig.click();
+
+        return new Promise(function (resolve) {
+            var waited = 0;
+            (function tick() {
+                var list = document.querySelector(MENU_LIST);
+                if (!list && waited < 2400) {
+                    waited += 120;
+                    setTimeout(tick, 120);
+                    return;
+                }
+                if (!list) {
+                    resolve({ error: '下拉没有打开' });
+                    return;
+                }
+
+                var data = {
+                    at: new Date().toISOString(),
+                    trigger: describeNode(trig),
+                    items: [],
+                    fiberUp: [],
+                };
+                var items = list.querySelectorAll(MENU_ITEM);
+                for (var i = 0; i < items.length && i < 40; i++) {
+                    var it = items[i];
+                    if (it.closest('[' + MENU_FLAG + ']')) continue; // 跳过我们自己插的那行
+                    var rec = describeNode(it);
+                    rec.name = itemName(it);
+                    rec.ariaSelected = it.getAttribute('aria-selected');
+                    data.items.push(rec);
+                    if (!data.fiberUp.length) data.fiberUp = describeFiberUp(it, 10);
+                }
+                if (!wasOpen) setTimeout(closeModelPopover, 120);
+                resolve(data);
+            })();
+        });
+    }
+
+    function reportProbe(data) {
+        var slim = {
+            at: data.at,
+            trigger: data.trigger,
+            items: data.items.slice(0, 12),
+            fiberUp: data.fiberUp,
+        };
+        var viaConfig = function () {
+            // 控制服务一直在跑，改的是 runtime.json，不需要重启应用。
+            // 只用于探测输出，键名带下划线避免和配置项混淆。
+            return ctx.control.configSet(PLUGIN_ID, { _probe: slim }).then(function () {
+                return { via: 'runtime.json', bytes: JSON.stringify(slim).length };
+            });
+        };
+        if (!ctx.backend || !ctx.backend.baseUrl) return viaConfig();
+        return ctx.backend
+            .fetch('/api/probe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(slim),
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (r) {
+                // reload 不重启 backend 进程：老进程没有新路由会回 404，自动退回写配置
+                if (r && r.ok) return { via: 'probe.json', bytes: r.bytes };
+                throw new Error((r && r.error) || 'backend 未响应');
+            })
+            .catch(viaConfig);
+    }
+
+    /* ---------- 走官方下拉的 React 回调切模型 ---------- */
+
+    /**
+     * 为什么不用 IPC
+     * -------------
+     * `session:setModel` 只改主进程里的会话记录，渲染层 store 不动；而发消息时
+     * `ensureSessionModelBeforeSend()` 用的是 store 里的值，于是下一条消息又用回旧模型。
+     * 实测也印证了：通道回 {success:true}，下拉文案没变。
+     *
+     * 唯一能把值写进 store 的入口，是下拉项的 React 回调。探测结果（probe.json）显示：
+     *   div.cr-model-selector__item  →  React props.onClick
+     *   fiber 上溯 3 层              →  ModelItem 组件，props 有 option / isSelected / onSelect
+     * 所以按 onSelect(option) → onSelect() → props.onClick(事件桩) → element.click() 依次尝试，
+     * 每步都等界面回查，谁先成功就用谁，不再靠"点了应该就成"。
+     */
+    function waitForMenu(ms) {
+        return new Promise(function (res) {
+            var t0 = Date.now();
+            (function tick() {
+                var l = document.querySelector(MENU_LIST);
+                if (l) return res(l);
+                if (Date.now() - t0 > ms) return res(null);
+                setTimeout(tick, 80);
+            })();
+        });
+    }
+
+    function waitLabel(expect, ms) {
+        return new Promise(function (res) {
+            var t0 = Date.now();
+            (function tick() {
+                var got = officialLabel();
+                if (got && got === expect) return res(true);
+                if (Date.now() - t0 > ms) return res(false);
+                setTimeout(tick, 100);
+            })();
+        });
+    }
+
+    /** 按显示名找下拉项。同名多项时取第一个（官方列表里同名模型通常只有一个）。 */
+    /** 读某一项对应的模型 id（从 ModelItem 的 props.option 里取）。
+     *  官方列表里同名的模型不止一个（hy4free / hy4std 都显示 "Hy4"），
+     *  只按名字找会挑错，所以能用 id 就用 id。 */
+    function itemModelId(it) {
+        var hit = findFiberWithFn(it, 'onSelect', 12);
+        var opt = hit && hit.props && hit.props.option;
+        if (!opt || typeof opt !== 'object') return '';
+        return String(opt.id || opt.modelId || opt.value || opt.key || '');
+    }
+
+    /** 按 id 找下拉项；找不到再按显示名兜底（老版本 option 里可能没有 id） */
+    function findMenuItem(modelId) {
+        var list = document.querySelector(MENU_LIST);
+        if (!list) return null;
+        var want = shortName(modelId);
+        var items = list.querySelectorAll(MENU_ITEM);
+        var byName = null;
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i];
+            if (it.closest('[' + MENU_FLAG + ']')) continue;
+            if (modelId && itemModelId(it) === modelId) return it;
+            if (!byName && itemName(it) === want) byName = it;
+        }
+        return byName;
+    }
+
+    /** 从元素所在 fiber 往上找第一个带指定回调的组件（不按组件名匹配，官方改名也不受影响） */
+    function findFiberWithFn(el, fnName, maxDepth) {
+        var k = reactKeyOf(el, '__reactFiber$');
+        var f = k ? el[k] : null;
+        var d = 0;
+        while (f && d < (maxDepth || 12)) {
+            var p = f.memoizedProps;
+            if (p && typeof p === 'object' && typeof p[fnName] === 'function') {
+                return { props: p, depth: d, type: typeName(f.type || f.elementType) };
+            }
+            f = f.return;
+            d++;
+        }
+        return null;
+    }
+
+    /** React 合成事件桩：onClick 内部常调 e.preventDefault()/stopPropagation()，无参调用会抛错 */
+    function evtStub(el) {
+        return {
+            type: 'click',
+            target: el,
+            currentTarget: el,
+            nativeEvent: {},
+            button: 0,
+            detail: 1,
+            bubbles: true,
+            cancelable: true,
+            defaultPrevented: false,
+            preventDefault: function () { this.defaultPrevented = true; },
+            stopPropagation: function () {},
+            isPropagationStopped: function () { return false; },
+            isDefaultPrevented: function () { return this.defaultPrevented; },
+            persist: function () {},
+        };
+    }
+
+    /** 用 React 回调选中某一项，返回用了哪个策略（结果可能是 Promise，由调用方等） */
+    function selectMenuItem(it) {
+        // 1) ModelItem.onSelect —— 官方语义入口，参数是这一项的 option
+        var hit = findFiberWithFn(it, 'onSelect', 12);
+        if (hit) {
+            var opt = hit.props.option;
+            try {
+                return { strategy: 'onSelect(option)', result: hit.props.onSelect(opt) };
+            } catch (e) {
+                ctx.log('onSelect(option) 抛错，改试无参', e);
+            }
+            try {
+                return { strategy: 'onSelect()', result: hit.props.onSelect() };
+            } catch (e2) {
+                ctx.log('onSelect() 抛错，改走 onClick', e2);
+            }
+        }
+        // 2) 行自身的 React onClick（内部就是 () => onSelect(option)）
+        var pk = reactKeyOf(it, '__reactProps$');
+        var props = pk ? it[pk] : null;
+        if (props && typeof props.onClick === 'function') {
+            try {
+                return { strategy: 'item.onClick', result: props.onClick(evtStub(it)) };
+            } catch (e3) {
+                ctx.log('item.onClick 抛错，最后用 DOM click', e3);
+            }
+        }
+        // 3) 兜底：程序化 DOM 点击（React 的事件委托照样能收到）
+        it.click();
+        return { strategy: 'item.click()', result: null };
+    }
+
+    /**
+     * 通过官方下拉把当前会话模型切到 modelId。
+     * 下拉没开就临时打开（用 openedByUs 记住，结束后收起来），开着就直接点。
+     * 返回 { ok, detail, strategy } —— ok 以界面回查为准，不看返回值。
+     */
+    function switchModelViaUI(modelId) {
+        if (!alive()) return Promise.resolve({ ok: false, detail: '实例已卸载' });
+        var want = shortName(modelId);
+        var trig = document.querySelector('.cr-model-selector__trigger');
+        if (!trig) return Promise.resolve({ ok: false, detail: '当前页面没有模型选择器' });
+        if (!want) return Promise.resolve({ ok: false, detail: '模型名为空' });
+
+        var focusBack = document.activeElement;
+        var openedByUs = false;
+        if (!document.querySelector(MENU_LIST)) {
+            trig.click();
+            openedByUs = true;
+        }
+
+        function done(res) {
+            if (openedByUs) setTimeout(closeModelPopover, 120);
+            // 临时点开下拉会抢焦点，操作完还给原来的输入框，别打断用户打字
+            if (openedByUs && focusBack && focusBack.focus) {
+                setTimeout(function () {
+                    try { focusBack.focus(); } catch (e) { /* ignore */ }
+                }, 200);
+            }
+            return res;
+        }
+
+        return waitForMenu(2400)
+            .then(function (list) {
+                if (!list) return { ok: false, detail: '下拉没有打开' };
+                var it = findMenuItem(modelId);
+                if (!it) return { ok: false, detail: '下拉里找不到「' + want + '」' };
+                // 「已经是它」只看 id：aria-selected 在某些版本里会被我们自己或别的
+                // 逻辑动过，用它判断会导致反复下发同一个模型。
+                var alreadyId = itemModelId(it);
+                if (alreadyId && alreadyId === modelId && officialLabel() === want) {
+                    return { ok: true, detail: '已经是「' + want + '」', strategy: 'skip' };
+                }
+                var picked = selectMenuItem(it);
+                return waitLabel(want, 1500).then(function (ok) {
+                    return {
+                        ok: ok,
+                        detail: ok
+                            ? '已切到「' + want + '」'
+                            : '调了 ' + picked.strategy + ' 但官方档位没变（当前 ' + officialLabel() + '）',
+                        strategy: picked.strategy,
+                    };
+                });
+            })
+            .catch(function (e) {
+                return { ok: false, detail: String((e && e.message) || e) };
+            })
+            .then(done);
+    }
 
     /** 当前官方档位的显示名（我们的覆盖标签之前调用） */
     function officialLabel() {
@@ -1111,6 +1778,7 @@ function activate(ctx) {
     var phaseTimer = null;
 
     function pollPhase() {
+        if (!alive()) return;
         var meta = window.__wbpro && window.__wbpro.meta;
         if (!meta || !meta.controlUrl || !state.duo) return;
         fetch(meta.controlUrl + '/api/duo/state?t=' + meta.controlToken)
@@ -1281,7 +1949,7 @@ function activate(ctx) {
         mainSel.innerHTML = selectHtml(state.mainModel);
         mainSel.style.cssText = 'flex:1;padding:4px 6px;border-radius:6px;background:rgba(255,255,255,.06);color:inherit;border:1px solid rgba(255,255,255,.14);';
         row('主模型').appendChild(mainSel);
-        note('决策与验收；开启「主从模型」时充当当前会话模型');
+        note('决策与验收；开启主从时会把当前会话模型真正切到它（不是只改显示）');
 
         var workerSel = document.createElement('select');
         workerSel.innerHTML = selectHtml(state.workerModel);
@@ -1313,10 +1981,18 @@ function activate(ctx) {
             save.disabled = true;
             saveConfig(patch)
                 .then(function (res) {
-                    // 只落配置：主模型就是当前会话模型，工作模型由 hook 在派发子代理时强制，
-                    // 不需要再去点官方下拉（那段模拟点击已删除）。
+                    // 主模型要在当前会话里真正生效，必须下发一次；工作模型由 hook 在派发子代理时强制。
+                    var willApply = !!(state.duo && patch.mainModel);
                     if (!res.synced) {
                         ctx.ui.toast('已保存到本地；控制服务未启动，运行 wbpro up 后会自动补写');
+                    } else if (willApply) {
+                        applyMainModel('panel-save').then(function (ok) {
+                            ctx.ui.toast(
+                                ok
+                                    ? '主模型已切到 ' + shortName(patch.mainModel)
+                                    : '已保存，但模型下发失败：' + (applyStat.err || '未知原因') + '（面板诊断里可看详情）',
+                            );
+                        });
                     } else if (patch.mainModel && !state.duo) {
                         ctx.ui.toast('主模型已保存；选中「主从模型」档位时生效');
                     } else if (patch.workerModel) {
@@ -1407,6 +2083,61 @@ function activate(ctx) {
         s.textContent = '会话：' + (sid ? sid.slice(0, 8) + '…' : '未识别');
         s.style.marginTop = '4px';
         diag.appendChild(s);
+
+        // 主模型下发结果：最容易出问题的一环，直接摆出来，不用翻控制台
+        var ap = document.createElement('div');
+        ap.style.marginTop = '4px';
+        ap.textContent =
+            '主模型切换：' +
+            (applyStat.tries === 0
+                ? '未触发'
+                : applyStat.ok + ' 成功 / ' + applyStat.fail + ' 失败' +
+                  (applyStat.channel ? ' · ' + applyStat.channel : '') +
+                  (applyStat.lastTarget ? ' · →' + shortName(applyStat.lastTarget) : '') +
+                  (applyStat.verify ? ' · 回查 ' + applyStat.verify : '') +
+                  (applyStat.err ? ' · ' + applyStat.err : ''));
+        diag.appendChild(ap);
+
+        // 现场验证用：不退出主从、不重开下拉，点一下就知道这条通道通不通
+        var retry = document.createElement('button');
+        retry.textContent = '试一次切换';
+        retry.style.cssText =
+            'margin-top:5px;padding:3px 8px;border-radius:5px;border:1px solid rgba(255,255,255,.18);' +
+            'background:transparent;color:inherit;cursor:pointer;font-size:11px;';
+        retry.onclick = function () {
+            retry.disabled = true;
+            applyMainModel('manual', 0, true).then(function (ok) {
+                retry.disabled = false;
+                ctx.ui.toast(ok ? '已下发，看顶部模型名有没有变成 ' + shortName(state.mainModel) : '下发失败：' + (applyStat.err || '未知'));
+                renderPanelBody();
+            });
+        };
+        diag.appendChild(retry);
+
+        // 抓一次下拉项的 React 结构（写 probe.json），用来确定「程序化选中」该调哪个回调
+        var probeBtn = document.createElement('button');
+        probeBtn.textContent = '抓取下拉结构';
+        probeBtn.style.cssText = retry.style.cssText + 'margin-left:6px;';
+        probeBtn.onclick = function () {
+            probeBtn.disabled = true;
+            probeMenu()
+                .then(function (data) {
+                    if (data.error) {
+                        ctx.ui.toast('探测失败：' + data.error);
+                        return null;
+                    }
+                    return reportProbe(data).then(function (r) {
+                        ctx.ui.toast('已写入 ' + r.via + '：' + data.items.length + ' 项 / ' + (r.bytes || 0) + ' 字节');
+                    });
+                })
+                .catch(function (e) {
+                    ctx.ui.toast('上报失败：' + ((e && e.message) || e));
+                })
+                .finally(function () {
+                    probeBtn.disabled = false;
+                });
+        };
+        diag.appendChild(probeBtn);
 
         var dp = document.createElement('div');
         dp.style.marginTop = '4px';

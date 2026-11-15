@@ -1,0 +1,439 @@
+{
+  "at": "2026-11-15T05:48:05.656Z",
+  "trigger": {
+    "tag": "BUTTON",
+    "reactPropsKey": "__reactProps$3i84ma6ooqm",
+    "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+    "propsKeys": [
+      "type",
+      "className",
+      "aria-disabled",
+      "aria-label",
+      "children",
+      "onClick",
+      "role",
+      "aria-expanded",
+      "aria-haspopup",
+      "aria-controls"
+    ],
+    "fnKeys": [
+      "onClick"
+    ],
+    "values": {}
+  },
+  "items": [
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "快速",
+      "ariaSelected": "false"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "均衡",
+      "ariaSelected": "false"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "极致",
+      "ariaSelected": "false"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "Hy4",
+      "ariaSelected": "false"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "Hy3",
+      "ariaSelected": "false"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "DeepSeek-V4.1-Flash",
+      "ariaSelected": "true"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "GLM-5.3",
+      "ariaSelected": "false"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "GLM-5.3-Flash",
+      "ariaSelected": "false"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "GLM-5.2",
+      "ariaSelected": "false"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "Space-Bunny",
+      "ariaSelected": "false"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "MiniMax-M3.1-Flash",
+      "ariaSelected": "false"
+    },
+    {
+      "tag": "DIV",
+      "reactPropsKey": "__reactProps$3i84ma6ooqm",
+      "reactFiberKey": "__reactFiber$3i84ma6ooqm",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "values": {},
+      "name": "Kimi-K3.1-Pro",
+      "ariaSelected": "false"
+    }
+  ],
+  "fiberUp": [
+    {
+      "depth": 0,
+      "type": "div",
+      "propsKeys": [
+        "className",
+        "role",
+        "data-testid",
+        "aria-selected",
+        "aria-disabled",
+        "title",
+        "onClick",
+        "children"
+      ],
+      "fnKeys": [
+        "onClick"
+      ],
+      "hasState": false
+    },
+    {
+      "depth": 1,
+      "type": "div",
+      "propsKeys": [
+        "className",
+        "onPointerDown",
+        "onPointerEnter",
+        "onPointerMove",
+        "onPointerLeave",
+        "onKeyDown",
+        "children"
+      ],
+      "fnKeys": [
+        "onPointerDown",
+        "onPointerEnter",
+        "onPointerMove",
+        "onPointerLeave",
+        "onKeyDown"
+      ],
+      "hasState": false
+    },
+    {
+      "depth": 2,
+      "type": "SubMenu",
+      "propsKeys": [
+        "placement",
+        "offset",
+        "openDelay",
+        "closeDelay",
+        "overlayClassName",
+        "content",
+        "children"
+      ],
+      "fnKeys": [],
+      "hasState": true
+    },
+    {
+      "depth": 3,
+      "type": "ModelItem",
+      "propsKeys": [
+        "option",
+        "isSelected",
+        "isThinking",
+        "currentEffort",
+        "onSelect",
+        "onToggleThinking",
+        "onSelectEffort",
+        "onSelectContextWindow",
+        "onPromotionAction",
+        "onFixClick",
+        "onTierUpgrade"
+      ],
+      "fnKeys": [
+        "onSelect",
+        "onToggleThinking",
+        "onSelectEffort",
+        "onSelectContextWindow",
+        "onPromotionAction",
+        "onFixClick",
+        "onTierUpgrade"
+      ],
+      "hasState": true
+    },
+    {
+      "depth": 4,
+      "type": "null",
+      "propsKeys": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16"
+      ],
+      "fnKeys": [],
+      "hasState": false
+    },
+    {
+      "depth": 5,
+      "type": "null",
+      "propsKeys": [
+        "0",
+        "1"
+      ],
+      "fnKeys": [],
+      "hasState": false
+    },
+    {
+      "depth": 6,
+      "type": "div",
+      "propsKeys": [
+        "className",
+        "children"
+      ],
+      "fnKeys": [],
+      "hasState": false
+    },
+    {
+      "depth": 7,
+      "type": "div",
+      "propsKeys": [
+        "className",
+        "children"
+      ],
+      "fnKeys": [],
+      "hasState": false
+    },
+    {
+      "depth": 8,
+      "type": "forwardRef(anon)",
+      "propsKeys": [
+        "rightOffset",
+        "className",
+        "children"
+      ],
+      "fnKeys": [],
+      "hasState": true
+    },
+    {
+      "depth": 9,
+      "type": "div",
+      "propsKeys": [
+        "className",
+        "style",
+        "role",
+        "children"
+      ],
+      "fnKeys": [],
+      "hasState": false
+    }
+  ]
+}

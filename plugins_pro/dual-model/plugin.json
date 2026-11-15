@@ -1,7 +1,7 @@
 {
   "id": "dual-model",
   "name": "双模型协同",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "managed": true,
   "description": "主模型决策 + 工作模型执行，并展示子代理的思考与工具调用轨迹",
   "renderer": "renderer.js",

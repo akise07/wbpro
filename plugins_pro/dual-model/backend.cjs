@@ -408,6 +408,27 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // POST /api/probe  → 页面侧把探测结果落盘（下拉项的 React 结构），
+    // 用来定位「程序化切换模型」该调哪个回调。只写插件目录下的 probe.json。
+    if (url.pathname === '/api/probe') {
+        let raw = '';
+        req.on('data', (c) => {
+            raw += c;
+            if (raw.length > 4 * 1024 * 1024) req.destroy();
+        });
+        req.on('end', () => {
+            try {
+                const data = JSON.parse(raw || '{}');
+                const file = path.join(__dirname, 'probe.json');
+                fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+                json(res, 200, { ok: true, file, bytes: raw.length });
+            } catch (e) {
+                json(res, 400, { error: String((e && e.message) || e) });
+            }
+        });
+        return;
+    }
+
     json(res, 404, { error: 'unknown route' });
 });
 
