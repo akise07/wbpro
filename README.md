@@ -237,10 +237,16 @@ POST /api/open-dir                  → 资源管理器打开插件目录
 |---|---|
 | 输入框上方触发器 | 标签变成 `⇄ 主从模型`（图标也换），提示里带 `主 xxx / 工 xxx` |
 | 下拉列表 | 勾选落在「主从模型」上，真实模型那一项的勾选隐藏（用 `html.wbpro-duo-mode` 下的 CSS） |
-| 再次点它 | 什么都不做（等同点已选中的模型），不会关掉 |
+| 再次点它 | 只是收起下拉，状态不变（幂等，不会误关） |
 | 点别的模型 | 立刻切回那个模型，协作档位退出、状态条移除 |
 
 关闭路径只有两条：选别的模型，或在面板里点「关闭」。
+
+**点击用 `pointerdown` 委托，不是 `click`**：只绑 `click` 会出现「要点两次才生效」——
+按下与抬起之间 React 可能重建下拉列表，我们插进去的克隆行被换成新节点，`click` 就落不到它身上。
+所以改成在 `document` 捕获阶段监听 `pointerdown`（最早的一个事件，节点被换掉也不影响判断）。
+顺带两处配套：`click` 只留作键盘激活（`detail === 0`）；`setDuo` 改成**幂等**（原来有个 400ms
+时间去抖，模拟点击删掉后它只会吞掉真实点击）。
 
 **状态显示在对话流里**，不是面板：`.cr-message-list` 内注入一条 `position: sticky; bottom: 8px` 的胶囊，内容随阶段变化——
 
@@ -258,14 +264,17 @@ POST /api/open-dir                  → 资源管理器打开插件目录
 
 | 角色 | 通道 | 生效时机 |
 |---|---|---|
-| 主模型 | **点官方模型下拉项**（渲染层 store → `onChange`） | 下一次发送时同步给 ACP 会话 |
+| 主模型 | **用户自己在官方下拉里选**（插件不插手） | 即时 |
 | 工作模型 | **hook 改写 `Agent` 工具入参的 `model`**（`PreToolUse.updatedInput`） | 每一次子代理调用，改完即生效 |
 
-**主模型为什么不能走 IPC**（5.9.3 实测）：`__wbInvoke('session:setModel', {sessionId, modelId})` 会老老实实返回 `{success:true}`，
-但下一条消息仍然是旧模型——它只改了主进程里的会话记录，没通知真正跑 Agent 的 ACP 连接。官方切换完全在渲染层：
-下拉项 `onClick` → 输入框 store `api.setModel(selection)` → `onChange` → 发送前 `ensureSessionModelBeforeSend` 才同步进会话。
-所以插件改成「展开下拉 → 点在那个真实档位上」，点完用触发器的 `aria-label`（`Select model: xxx`）复核，
-没变就报错，不再假成功。
+**为什么插件不再切主模型**：早期以为 IPC 切换无效（`__wbInvoke('session:setModel')` 返回
+`{success:true}` 但下一条消息仍用旧模型，它只改主进程会话记录、没通知 ACP 连接），
+于是写了一套「展开下拉 → 模拟点击真实档位 → 用 `aria-label` 复核」的绕路方案。
+后来模型分配改成由 hook 在派发子代理时强制工作模型，**主模型就是当前会话模型，根本不需要插件去切**。
+那段代码就成了纯负担：它要跟 React 的重渲染抢时序（`syncingMain` 的 150ms 窗口兜不住异步切换），
+表现为「点主从模型开了又立刻关」「两个条目同时高亮」「标签来回闪」。
+已整体删除（`applyMainModel` / `clickNode` / `waitForList` / `waitApplied` / `findMenuItem` 等），
+现在主模型只读：开启协作时把界面实际档位记进 `mainModel` 用于显示与提示，不做任何切换。
 
 **工作模型为什么不走环境变量**：CLI 的 `resolveAgentModel()` 是 **env 优先于调用参数**——
 `CODEBUDDY_CODE_SUBAGENT_MODEL` 一旦注入，`Agent` 工具里的 `model` 就被忽略，改模型还得重启。
@@ -672,6 +681,15 @@ await window.__wbInvoke('config:getProductConfiguration')   // → { models: 66,
 | 主模型切换 | `__wbInvoke('session:setModel', ...)` | 通道只回 `{success:true}`、不回模型 id，因此面板显示「已请求切换，以界面为准」 |
 
 **配置存放**：`~/.workbuddy/plugins_pro/dual-model/runtime.json`。页面侧通过控制服务的 `/api/config/dual-model` 读写，`wbpro` 启动时读同一份文件注入环境变量。
+
+**`saveConfig` 只允许回灌本次改动的键**——这是踩过的坑，写下来免得再犯：
+
+`setDuo(true)` 里会先后发两次保存（`{mainModel}` 和 `{duo:true}`）。如果保存函数拿「整包本地缓存」去 `applyCfg`，
+那个缓存里的 `duo` 还是旧值 `false`，于是刚置真的状态立刻被改回假，下拉里「已启用」会闪一帧「协作」再回来。
+所以现在：写入只 `applyCfg(patch)`；服务端回包里凡是本会话写过的键（`dirtyKeys`）一律不采信。
+用最小模型复现过这条竞态，修复前状态序列是 `false → true → false → true`，修复后零翻转。
+
+面板诊断里的「状态翻转 n」就是这条路径的计数器：点一次只该 +1，界面若还在闪，这个数会一直涨。
 
 **自检区**：面板底部的四项（宿主对象 / `__wbInvoke` / `__wbOn` / `setSessionModel`）是运行时探测结果。如果 `setSessionModel` 是 ✕，说明这个版本的宿主没暴露该接口，主模型只能靠 `settings.json` 改——其余功能不受影响。
 
