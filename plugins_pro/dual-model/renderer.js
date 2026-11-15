@@ -1947,29 +1947,6 @@ function activate(ctx) {
         return bits.join(' · ');
     }
 
-    function selectHtml(id) {
-        var opts = ['<option value="">（未设置）</option>'];
-        modelList.forEach(function (m) {
-            var sel = m.id === id ? ' selected' : '';
-            opts.push(
-                '<option value="' + esc(m.id) + '"' + sel + ' title="' + esc(modelTitle(m)) + '">' +
-                    esc(modelLabel(m)) +
-                '</option>',
-            );
-        });
-        // 已保存的模型若不在当前官方列表里（下架/换名），仍然保留可选项，避免静默丢配置
-        if (id) {
-            var known = false;
-            for (var i = 0; i < modelList.length; i++) {
-                if (modelList[i].id === id) { known = true; break; }
-            }
-            if (!known) {
-                opts.push('<option value="' + esc(id) + '" selected>' + esc(id) + '（不在当前官方列表）</option>');
-            }
-        }
-        return opts.join('');
-    }
-
     var bodyEl = null;
 
     function renderPhaseRow() {
@@ -1982,10 +1959,217 @@ function activate(ctx) {
         });
     }
 
+    // 当前面板里活着的 picker。面板重建时统一关掉，避免它们的 document 监听器泄漏。
+    var livePickers = [];
+    function closeOpenPickers() {
+        for (var i = 0; i < livePickers.length; i++) {
+            try { livePickers[i].destroy(); } catch (e) { /* ignore */ }
+        }
+        livePickers = [];
+    }
+
+    /**
+     * 自绘下拉：替代原生 <select>。
+     *
+     * 为什么不用 <select>：它的弹出列表由 Chromium 直接绘制，CSS 只能改控件本身，
+     * 展开后仍是白底 + 浅灰字（深色面板上几乎看不清）。`color-scheme:dark` 在部分
+     * 版本上只作用于控件、不作用于弹层，不可靠。自绘后颜色、圆角、滚动全部可控。
+     *
+     * 返回 { el, value }，value 是 getter/setter，调用方仍按原来的方式读写。
+     */
+    function makePicker(initialId) {
+        var current = initialId || '';
+        var wrap = document.createElement('div');
+        wrap.style.cssText = 'position:relative;flex:1;min-width:0;';
+
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.style.cssText =
+            'width:100%;display:flex;align-items:center;gap:6px;text-align:left;' +
+            'padding:4px 8px;border-radius:6px;font:inherit;' +
+            'background:rgba(255,255,255,.06);color:inherit;cursor:pointer;' +
+            'border:1px solid rgba(255,255,255,.14);';
+        var btnTxt = document.createElement('span');
+        btnTxt.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+        var btnArrow = document.createElement('span');
+        btnArrow.textContent = '\u25be';
+        btnArrow.style.cssText = 'opacity:.55;flex:none;font-size:10px;';
+        btn.appendChild(btnTxt);
+        btn.appendChild(btnArrow);
+        wrap.appendChild(btn);
+
+        var list = document.createElement('div');
+        // 用 position:fixed 而不是 absolute：面板容器 .p 带 overflow:hidden，
+        // absolute 的浮层会被直接裁掉（列表一开就被切掉一半）。
+        // fixed 挂在视口坐标系上，不受祖先裁剪影响，位置在 open() 里按按钮实时算。
+        list.style.cssText = [
+            'position:fixed', 'z-index:2147483600', 'display:none',
+            'min-width:200px', 'max-height:260px', 'overflow-y:auto',
+            'background:#26262b', 'color:#e9e9ec',
+            'border:1px solid rgba(255,255,255,.16)', 'border-radius:8px',
+            'box-shadow:0 8px 24px rgba(0,0,0,.5)',
+            'padding:4px', 'font:12px/1.5 system-ui,-apple-system,sans-serif',
+            // 深色面板上的滚动条默认是浅色，很扎眼；这两条让它融进背景
+            'scrollbar-width:thin', 'scrollbar-color:rgba(255,255,255,.22) transparent',
+        ].join(';');
+        // 挂到 body 上，彻底脱离面板的层叠与裁剪上下文
+        document.body.appendChild(list);
+
+        // 列表自己吃掉滚轮：它是 fixed 挂在 body 上的，滚到底时浏览器会把滚动
+        // "链"给后面的文档，文档一滚，上面的 onScroll 就会把列表关掉。
+        // 这里在边界处吞掉事件，滚到头也不会外溢。
+        list.addEventListener(
+            'wheel',
+            function (e) {
+                var atTop = list.scrollTop <= 0;
+                var atBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 1;
+                if ((atTop && e.deltaY < 0) || (atBottom && e.deltaY > 0)) e.preventDefault();
+                e.stopPropagation();
+            },
+            { passive: false },
+        );
+
+        function label(id) {
+            if (!id) return '（未设置）';
+            for (var i = 0; i < modelList.length; i++) {
+                if (modelList[i].id === id) return modelLabel(modelList[i]);
+            }
+            return id + '（不在当前官方列表）';
+        }
+
+        function syncBtn() {
+            btnTxt.textContent = label(current);
+            btn.title = current || '';
+        }
+
+        function buildList() {
+            list.innerHTML = '';
+            var items = [{ id: '', label: '（未设置）', title: '' }];
+            modelList.forEach(function (m) {
+                items.push({ id: m.id, label: modelLabel(m), title: modelTitle(m) });
+            });
+            // 已保存但已下架/换名的模型仍保留，避免静默丢配置
+            if (current && !byId(current)) items.push({ id: current, label: label(current), title: '' });
+
+            items.forEach(function (it) {
+                var o = document.createElement('div');
+                o.textContent = it.label;
+                // 能力信息（上下文长度、是否支持思考）放 tooltip，不占列表宽度
+                if (it.title) o.title = it.title;
+                o.style.cssText =
+                    'padding:5px 8px;border-radius:5px;cursor:pointer;white-space:nowrap;' +
+                    'overflow:hidden;text-overflow:ellipsis;' +
+                    (it.id === current ? 'background:rgba(127,119,221,.28);' : '');
+                o.onmouseenter = function () { if (it.id !== current) o.style.background = 'rgba(255,255,255,.09)'; };
+                o.onmouseleave = function () { o.style.background = it.id === current ? 'rgba(127,119,221,.28)' : ''; };
+                o.onclick = function (ev) {
+                    ev.stopPropagation();
+                    current = it.id;
+                    syncBtn();
+                    buildList();
+                    close();
+                };
+                list.appendChild(o);
+            });
+        }
+
+        function open() {
+            buildList();
+            // 先显示再量尺寸，否则拿到的是 0
+            list.style.display = 'block';
+            list.style.visibility = 'hidden';
+            var r = btn.getBoundingClientRect();
+            var lh = list.offsetHeight || 0;
+            var vh = window.innerHeight;
+            var top = r.bottom + 4;
+            // 下面放不下就翻到上面，别让列表跑到屏幕外
+            if (top + lh > vh - 8 && r.top - lh - 4 > 8) top = r.top - lh - 4;
+            list.style.top = Math.max(8, top) + 'px';
+            list.style.left = Math.max(8, Math.min(r.left, window.innerWidth - (list.offsetWidth || 200) - 8)) + 'px';
+            list.style.visibility = '';
+            btn.setAttribute('data-open', '1');
+            // 同步挂上"点别处关闭"，**不要 setTimeout**。
+            // open() 是在按钮自己的 pointerdown（目标阶段）里调的，此时 document 的
+            // 捕获阶段早已走完，所以同步挂监听不会被这次按下自己触发；
+            // 反过来若延迟到下一任务再挂，两次快速点击之间会出现"没人监听"的窗口。
+            document.addEventListener('pointerdown', onPress, true);
+            // 面板可拖动、页面可滚动：位置一变，fixed 的列表就和按钮脱节了，收起更自然。
+            // 但**必须放过列表自己的滚动** —— scroll 不冒泡，这里用的是捕获监听，
+            // 会收到所有元素的滚动；不加判断的话，用户一滚列表就把列表关了。
+            window.addEventListener('resize', close);
+            window.addEventListener('scroll', onScroll, true);
+        }
+        function onScroll(e) {
+            var t = e.target;
+            // 列表内部（以及它所在的按钮容器）的滚动不算"位置变了"
+            if (t === list || list.contains(t)) return;
+            if (t === wrap || wrap.contains(t)) return;
+            // 文档级滚动（document / body / html）才需要收
+            close();
+        }
+        function onPress(e) {
+            var t = e.target;
+            if (!t) return;
+            if (wrap.contains(t) || list.contains(t)) return;
+            // 在别处按下（含拖标题栏、点另一个 picker 的按钮）就收起。
+            // 这一步在 document 捕获阶段执行，早于目标按钮自己的 pointerdown，
+            // 所以"关旧的 + 开新的"落在同一帧里，不会出现空档。
+            close();
+        }
+        function close() {
+            list.style.display = 'none';
+            btn.removeAttribute('data-open');
+            document.removeEventListener('pointerdown', onPress, true);
+            window.removeEventListener('resize', close);
+            window.removeEventListener('scroll', onScroll, true);
+        }
+        /** 彻底销毁：list 挂在 body 上，面板重建时不能只清 innerHTML，否则节点会残留 */
+        function destroy() {
+            close();
+            if (list.parentNode) list.parentNode.removeChild(list);
+        }
+
+        // 开关都放在 pointerdown 里做，**不能拆成 pointerdown 关、click 开**：
+        // 一个 picker 开着时点另一个的按钮，pointerdown 先把前者关掉，click 才打开后者，
+        // 中间隔了约 100ms，屏幕上就是"消失一下再出现"的闪。
+        // 现在两者都在同一个 pointerdown 事件里完成（A 在 document 捕获阶段关闭，
+        // B 在目标阶段打开），同一帧内收尾，只有一次绘制。
+        btn.addEventListener('pointerdown', function (e) {
+            if (e.button !== 0) return;
+            e.stopPropagation();
+            if (list.style.display === 'block') close();
+            else open();
+        });
+        // 键盘激活（Enter / Space）没有 pointerdown，只能走 click，且 detail === 0。
+        // 鼠标点击的 detail >= 1，已经被上面的 pointerdown 处理过，这里必须跳过，
+        // 否则会"开了又关"。
+        btn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            if (e.detail === 0) {
+                if (list.style.display === 'block') close();
+                else open();
+            }
+        });
+
+        syncBtn();
+        var handle = {
+            el: wrap,
+            get value() { return current; },
+            set value(v) { current = v || ''; syncBtn(); },
+            close: close,
+            destroy: destroy,
+        };
+        livePickers.push(handle);
+        return handle;
+    }
+
     function renderPanelBody(target) {
         bodyEl = target || (panelRef && panelRef.body) || bodyEl;
         if (!bodyEl) return;
         var body = bodyEl;
+        // 重建前先关掉上一轮的下拉：picker 打开时会在 document 上挂一个捕获监听，
+        // 只靠 innerHTML='' 清不掉它（节点没了，监听器还在，越积越多）。
+        if (typeof closeOpenPickers === 'function') closeOpenPickers();
         body.innerHTML = '';
         body.style.cssText = 'min-width:380px;font:12px/1.6 system-ui,-apple-system,sans-serif;';
 
@@ -2046,16 +2230,16 @@ function activate(ctx) {
         duoRow.appendChild(duoBtn);
         body.appendChild(duoRow);
 
-        var mainSel = document.createElement('select');
-        mainSel.innerHTML = selectHtml(state.mainModel);
-        mainSel.style.cssText = 'flex:1;padding:4px 6px;border-radius:6px;background:rgba(255,255,255,.06);color:inherit;border:1px solid rgba(255,255,255,.14);';
-        row('主模型').appendChild(mainSel);
+        // 原生 <select> 的**弹出列表**是 Chromium 自己画的，CSS 改不到里面
+        // （只能改控件本身）：展开后白底 + 浅灰字，几乎看不清。
+        // color-scheme:dark 在部分版本上只影响控件、不影响弹层，靠不住。
+        // 所以这里换成自绘下拉：一个按钮 + 一个绝对定位的列表，颜色完全可控。
+        var mainSel = makePicker(state.mainModel);
+        row('主模型').appendChild(mainSel.el);
         note('决策与验收；开启主从时会把当前会话模型真正切到它（不是只改显示）');
 
-        var workerSel = document.createElement('select');
-        workerSel.innerHTML = selectHtml(state.workerModel);
-        workerSel.style.cssText = mainSel.style.cssText;
-        row('工作模型').appendChild(workerSel);
+        var workerSel = makePicker(state.workerModel);
+        row('工作模型').appendChild(workerSel.el);
         note('执行计划；由 hook 在每次子代理调用时指定，改完下一次委派即生效');
 
         var turns = document.createElement('input');
@@ -2277,6 +2461,8 @@ function activate(ctx) {
             css: '.p{min-width:380px}',
             persist: true,
             onClose: function () {
+                // 面板关掉时 picker 节点随之消失，但它们的 document 监听器还挂着，必须主动关
+                closeOpenPickers();
                 panelRef = null;
             },
             render: function (b) {
@@ -2373,6 +2559,7 @@ function activate(ctx) {
         var rowNode = document.querySelector('[' + MENU_FLAG + ']');
         if (rowNode) rowNode.remove();
         if (!(panelRef && panelRef.persist)) panelRef && panelRef.remove();
+        closeOpenPickers();
         panelRef = null;
         badge && badge.remove();
         badge = null;
